@@ -20,6 +20,9 @@ import TanStackDataTable from '../../components/TanStackDataTable';
 import type { ExcelConversionRequest, ExcelConversionResponse } from '../../workers/excel.worker';
 import { useAppStore } from '../../store/AppContext';
 import { copyToClipboard } from '../../utils/jsonUtils';
+import { perfMark, perfMeasure } from '../../utils/perf';
+import type { PreviewChunkPayload } from '../../types/worker';
+import { CONVERTER_LIMITS } from '../../constants';
 
 type ConversionMode = 'json-to-excel' | 'excel-to-json';
 type ViewType = 'json' | 'table';
@@ -29,7 +32,6 @@ const JsonExcelConverter: React.FC = () => {
     const {
         file,
         inputData,
-        tableData,
         mode,
         totalRows,
         isDirty,
@@ -40,11 +42,13 @@ const JsonExcelConverter: React.FC = () => {
     const [resultData, setResultData] = useState<any>(null);
     const [viewType, setViewType] = useState<ViewType>('table');
     const [isJsonCopied, setIsJsonCopied] = useState(false);
+    const [localInputData, setLocalInputData] = useState(inputData);
+    const [previewRows, setPreviewRows] = useState<any[]>([]);
+    const [previewTotalRows, setPreviewTotalRows] = useState<number | null>(totalRows);
 
     // State setters tied to global store
     const setFile = (val: File | null) => setJsonExcel({ file: val });
     const setInputData = (val: string) => setJsonExcel({ inputData: val });
-    const setTableData = (val: any[]) => setJsonExcel({ tableData: val });
     const setMode = (val: ConversionMode) => setJsonExcel({ mode: val });
     const setTotalRows = (val: number | null) => setJsonExcel({ totalRows: val });
     const setIsDirty = (val: boolean) => setJsonExcel({ isDirty: val });
@@ -70,15 +74,39 @@ const JsonExcelConverter: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
     const [isParsing, setIsParsing] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [previewStartedAt, setPreviewStartedAt] = useState<number | null>(null);
+    const activeTableData = previewRows;
+    const activeTotalRows = previewTotalRows ?? totalRows;
+    const previewTargetRows = Math.min(activeTotalRows ?? 1000, 1000);
+    const previewLoadedRows = Math.min(previewRows.length, previewTargetRows);
+    const previewProgressPct = previewTargetRows > 0
+        ? Math.min(100, Math.round((previewLoadedRows / previewTargetRows) * 100))
+        : 0;
+    const elapsedSeconds = previewStartedAt ? Math.max((Date.now() - previewStartedAt) / 1000, 0.001) : 0;
+    const previewRowsPerSec = previewLoadedRows > 0 && elapsedSeconds > 0 ? Math.round(previewLoadedRows / elapsedSeconds) : 0;
+    const previewRemainingRows = Math.max(previewTargetRows - previewLoadedRows, 0);
+    const previewEtaSeconds = previewRowsPerSec > 0 ? Math.ceil(previewRemainingRows / previewRowsPerSec) : null;
+    const previewEtaLabel = previewEtaSeconds === null
+        ? null
+        : previewEtaSeconds < 60
+            ? `${previewEtaSeconds}s`
+            : `${Math.floor(previewEtaSeconds / 60)}m ${previewEtaSeconds % 60}s`;
+    const etaConfidence = previewRowsPerSec > 0 && previewLoadedRows >= 300 && elapsedSeconds >= 2 ? 'Stable' : 'Calibrating';
+    const previewSafeModeActive = Boolean(
+        file
+        && file.size > CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES
+        && (mode === 'excel-to-json' || isDirectMode || !localInputData.trim())
+    );
+    const safeModeLimitMb = Math.round(CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES / (1024 * 1024));
     const jsonPreviewText = useMemo(() => {
         if (resultData && mode === 'excel-to-json') {
             return JSON.stringify(resultData, null, 2);
         }
-        if (tableData.length > 0) {
-            return JSON.stringify(tableData, null, 2);
+        if (activeTableData.length > 0) {
+            return JSON.stringify(activeTableData, null, 2);
         }
         return '';
-    }, [resultData, mode, tableData]);
+    }, [resultData, mode, activeTableData]);
 
     const workerRef = useRef<WorkerManager<ExcelConversionRequest, ExcelConversionResponse> | null>(null);
 
@@ -97,19 +125,43 @@ const JsonExcelConverter: React.FC = () => {
         };
     }, []);
 
+    useEffect(() => {
+        setLocalInputData(inputData);
+    }, [inputData]);
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            if (localInputData !== inputData) {
+                setInputData(localInputData);
+            }
+        }, 180);
+        return () => window.clearTimeout(timer);
+    }, [localInputData, inputData]);
+
+    useEffect(() => {
+        setPreviewTotalRows(totalRows);
+    }, [totalRows]);
+
     const validateAndPreview = useCallback(async () => {
         setError(null);
+        if (previewSafeModeActive) {
+            setError(`Preview is disabled in Safe Mode for files above ${safeModeLimitMb}MB. Use Convert & Export.`);
+            return;
+        }
+        perfMark('json-excel-preview-start');
+        setPreviewStartedAt(Date.now());
+        let firstChunkMeasured = false;
 
         if (mode === 'json-to-excel') {
-            if (!inputData.trim() && !file) {
+            if (!localInputData.trim() && !file) {
                 setError('Please enter JSON data or upload a file first');
                 return;
             }
 
             // Validate JSON syntax before processing
-            if (!isDirectMode && inputData.trim()) {
+            if (!isDirectMode && localInputData.trim()) {
                 try {
-                    JSON.parse(inputData);
+                    JSON.parse(localInputData);
                 } catch (e) {
                     setError(`Invalid JSON syntax: ${e instanceof Error ? e.message : 'Please check your JSON format'}`);
                     return;
@@ -126,39 +178,51 @@ const JsonExcelConverter: React.FC = () => {
         setTaskStatus({ state: 'running', label: 'Preparing preview' });
         workerRef.current?.cancelAll('Superseded by a newer preview request');
         initWorker();
+        setPreviewRows([]);
+        setPreviewTotalRows(null);
+        setTotalRows(null);
 
         // Add timeout protection
         const timeoutId = setTimeout(() => {
             setIsParsing(false);
             setError('Processing timeout - file may be too large or complex. Try a smaller dataset.');
+            setPreviewStartedAt(null);
         }, 30000); // 30 second timeout
 
         try {
             let data: any;
             let transfer: Transferable[] | undefined;
+            const collectedRows: any[] = [];
+            let collectedTotalRows: number | null = null;
 
             if (mode === 'json-to-excel') {
                 if (isDirectMode && file) {
                     data = await file.arrayBuffer();
                     transfer = [data];
                 } else {
-                    data = inputData;
+                    data = localInputData;
                 }
 
-                const result = await workerRef.current!.postMessage('PARSE_FOR_PREVIEW', {
+                await workerRef.current!.postMessage('PARSE_FOR_PREVIEW_STREAM', {
                     data,
                     options: { flatten }
-                } as any, transfer, 0);
+                } as any, transfer, 0, (progressData) => {
+                    const payload = progressData as PreviewChunkPayload;
+                    if (!Array.isArray(payload?.chunk)) return;
+                    if (!firstChunkMeasured && payload.chunk.length > 0) {
+                        perfMark('json-excel-preview-first-chunk');
+                        perfMeasure('json-excel-first-preview', 'json-excel-preview-start', 'json-excel-preview-first-chunk');
+                        firstChunkMeasured = true;
+                    }
+                    collectedRows.push(...payload.chunk);
+                    setPreviewRows((prev) => [...prev, ...payload.chunk]);
+                    if (typeof payload.totalRows === 'number') {
+                        collectedTotalRows = payload.totalRows;
+                        setPreviewTotalRows(payload.totalRows);
+                    }
+                });
 
-                const previewData = (result as any).data;
-                const total = (result as any).totalRows;
-
-                if (!previewData || !Array.isArray(previewData)) {
-                    throw new Error('Invalid data format received from worker');
-                }
-
-                setTableData(previewData);
-                setTotalRows(total);
+                setTotalRows(collectedTotalRows ?? collectedRows.length);
                 setViewType('table');
                 setIsDirty(false);
             } else {
@@ -178,39 +242,49 @@ const JsonExcelConverter: React.FC = () => {
                 }
 
                 setResultData(jsonData);
-                setTableData(Array.isArray(jsonData) ? jsonData.slice(0, 1000) : [jsonData]);
-                setTotalRows(Array.isArray(jsonData) ? jsonData.length : 1);
+                const nextPreview = Array.isArray(jsonData) ? jsonData.slice(0, 1000) : [jsonData];
+                const nextTotal = Array.isArray(jsonData) ? jsonData.length : 1;
+                setPreviewRows(nextPreview);
+                setPreviewTotalRows(nextTotal);
+                setTotalRows(nextTotal);
                 setViewType('table');
                 setIsDirty(false);
             }
 
+            perfMark('json-excel-preview-complete');
+            perfMeasure('json-excel-preview-total', 'json-excel-preview-start', 'json-excel-preview-complete');
             clearTimeout(timeoutId);
             setTaskStatus({ state: 'done', label: 'Preview ready' });
         } catch (e) {
             if (WorkerManager.isCancelledError(e)) return;
             setError(`Preview failed: ${e instanceof Error ? e.message : 'Invalid data structure'}`);
             setTaskStatus({ state: 'error', label: 'Preview failed' });
+            setPreviewStartedAt(null);
         } finally {
             setIsParsing(false);
         }
-    }, [inputData, file, isDirectMode, flatten, initWorker, mode, setTaskStatus]);
+    }, [localInputData, file, isDirectMode, flatten, initWorker, mode, previewSafeModeActive, safeModeLimitMb, setTaskStatus]);
 
     const handleFileSelect = async (selectedFile: File) => {
         setFile(selectedFile);
         setError(null);
-        setTableData([]);
+        setPreviewRows([]);
         setTotalRows(null);
+        setPreviewTotalRows(null);
+        setPreviewStartedAt(null);
 
         // Optimization: Files > 1MB use Direct Mode
         if (selectedFile.size > 1 * 1024 * 1024) {
             setIsDirectMode(true);
             setInputData(''); // Clear to save memory
+            setLocalInputData('');
         } else {
             setIsDirectMode(false);
             if (mode === 'json-to-excel' && selectedFile.name.toLowerCase().endsWith('.json')) {
                 try {
                     const text = await selectedFile.text();
                     setInputData(text);
+                    setLocalInputData(text);
                 } catch (err) {
                     setError('Failed to read JSON file');
                 }
@@ -222,21 +296,20 @@ const JsonExcelConverter: React.FC = () => {
         workerRef.current?.cancelAll('Cleared by user');
         setFile(null);
         setInputData('');
-        setTableData([]);
+        setLocalInputData('');
+        setPreviewRows([]);
         setTotalRows(null);
+        setPreviewTotalRows(null);
+        setPreviewStartedAt(null);
         setResultData(null);
         setError(null);
         setIsDirectMode(false);
     };
 
     const handleConvert = async () => {
-        if (tableData.length === 0) {
-            setError('Please preview your data first');
-            return;
-        }
-
         setIsLoading(true);
         setError(null);
+        perfMark('json-excel-export-start');
         setTaskStatus({ state: 'running', label: mode === 'json-to-excel' ? 'Converting to Excel' : 'Converting to JSON' });
         workerRef.current?.cancelAll('Superseded by a newer conversion request');
         initWorker();
@@ -252,17 +325,20 @@ const JsonExcelConverter: React.FC = () => {
             let transfer: Transferable[] | undefined;
 
             if (mode === 'json-to-excel') {
-                if (!isDirty && (file || inputData)) {
-                    // Export full original data if not edited
+                if (activeTableData.length > 0 && isDirty) {
+                    data = JSON.stringify(activeTableData);
+                } else {
                     if (isDirectMode && file) {
                         data = await file.arrayBuffer();
                         transfer = [data];
+                    } else if (localInputData.trim()) {
+                        data = localInputData;
+                    } else if (file) {
+                        data = await file.arrayBuffer();
+                        transfer = [data];
                     } else {
-                        data = inputData;
+                        throw new Error('Please provide JSON data or upload a file');
                     }
-                } else {
-                    // Use edited table data
-                    data = JSON.stringify(tableData);
                 }
             } else {
                 if (!file) throw new Error('Please upload an Excel file');
@@ -301,11 +377,16 @@ const JsonExcelConverter: React.FC = () => {
                 URL.revokeObjectURL(url);
 
                 setResultData(jsonData);
-                setTableData(Array.isArray(jsonData) ? jsonData.slice(0, 1000) : [jsonData]);
-                setTotalRows(Array.isArray(jsonData) ? jsonData.length : 1);
+                const nextPreview = Array.isArray(jsonData) ? jsonData.slice(0, 1000) : [jsonData];
+                const nextTotal = Array.isArray(jsonData) ? jsonData.length : 1;
+                setPreviewRows(nextPreview);
+                setPreviewTotalRows(nextTotal);
+                setTotalRows(nextTotal);
                 setViewType('table');
             }
 
+            perfMark('json-excel-export-complete');
+            perfMeasure('json-excel-export-total', 'json-excel-export-start', 'json-excel-export-complete');
             clearTimeout(timeoutId);
             setTaskStatus({ state: 'done', label: 'Conversion complete' });
         } catch (err) {
@@ -334,8 +415,14 @@ const JsonExcelConverter: React.FC = () => {
         workerRef.current?.cancelAll('Cancelled by user');
         setIsParsing(false);
         setIsLoading(false);
+        setPreviewStartedAt(null);
         setTaskStatus({ state: 'cancelled', label: 'Operation cancelled' });
     }, [setTaskStatus]);
+
+    const canPreview = mode === 'json-to-excel'
+        ? Boolean(localInputData.trim() || file)
+        : Boolean(file);
+    const canRunPreview = canPreview && !previewSafeModeActive;
 
     return (
         <div className="h-full flex flex-col space-y-4 sm:space-y-6">
@@ -367,6 +454,14 @@ const JsonExcelConverter: React.FC = () => {
                         <Trash2 className="w-4 h-4" />
                         <span className="text-sm font-bold">Reset</span>
                     </button>
+                    <button
+                        onClick={validateAndPreview}
+                        disabled={isParsing || isLoading || !canRunPreview}
+                        className="btn-secondary h-11 px-5 disabled:opacity-50"
+                    >
+                        {isParsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
+                        <span className="text-sm font-bold">Open Preview & Edit</span>
+                    </button>
                     {(isParsing || isLoading) && (
                         <button onClick={handleCancelCurrentTask} className="btn-secondary h-11 px-5">
                             <XCircle className="w-4 h-4 text-red-500" />
@@ -375,13 +470,30 @@ const JsonExcelConverter: React.FC = () => {
                     )}
                     <button
                         onClick={handleConvert}
-                        disabled={isLoading || tableData.length === 0}
+                        disabled={isLoading}
                         className="btn-primary-gradient h-11 px-8 shadow-indigo-100"
                     >
                         {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                        <span className="text-sm">{mode === 'json-to-excel' ? 'Export Excel' : 'Generate JSON'}</span>
+                        <span className="text-sm">{mode === 'json-to-excel' ? 'Convert & Export Excel' : 'Convert & Export JSON'}</span>
                     </button>
                 </div>
+            </div>
+            <div className="mx-1 -mt-1 rounded-2xl border border-indigo-200/70 bg-gradient-to-r from-indigo-50 via-white to-cyan-50 px-4 py-3 shadow-sm">
+                <p className="text-[10px] font-black uppercase tracking-[0.16em] text-indigo-700">Workflow</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                    <span className="rounded-full bg-indigo-600 text-white px-3 py-1 font-bold">
+                        1. {mode === 'json-to-excel' ? 'Convert & Export Excel' : 'Convert & Export JSON'}
+                    </span>
+                    <span className="rounded-full bg-white border border-indigo-200 text-indigo-700 px-3 py-1 font-semibold">2. Open Preview & Edit (if needed)</span>
+                </div>
+                <p className="mt-2 text-xs text-slate-700">
+                    Fastest path is direct export. Open preview only when you need to validate or edit rows.
+                </p>
+                {previewSafeModeActive && (
+                    <p className="mt-2 text-xs text-amber-700 font-semibold">
+                        Safe Mode active: preview is disabled for this large file to keep the app responsive.
+                    </p>
+                )}
             </div>
 
             {/* Main Content Area */}
@@ -417,8 +529,8 @@ const JsonExcelConverter: React.FC = () => {
                                         <Editor
                                             height="100%"
                                             defaultLanguage="json"
-                                            value={inputData}
-                                            onChange={(value) => setInputData(value || '')}
+                                            value={localInputData}
+                                            onChange={(value) => setLocalInputData(value || '')}
                                             theme="light"
                                             options={{ ...editorOptions, padding: { top: 20, bottom: 20 } }}
                                         />
@@ -440,11 +552,11 @@ const JsonExcelConverter: React.FC = () => {
                                     />
                                     <button
                                         onClick={validateAndPreview}
-                                        disabled={isParsing || (!inputData.trim() && !file)}
+                                        disabled={isParsing || !canRunPreview}
                                         className="btn-primary h-11 w-full bg-indigo-600 hover:bg-indigo-700"
                                     >
                                         {isParsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-                                        <span className="text-sm">Compute Table</span>
+                                        <span className="text-sm">Open Preview & Edit</span>
                                     </button>
                                 </div>
                             </div>
@@ -466,11 +578,11 @@ const JsonExcelConverter: React.FC = () => {
                                 {file && (
                                     <button
                                         onClick={validateAndPreview}
-                                        disabled={isParsing}
+                                        disabled={isParsing || !canRunPreview}
                                         className="btn-primary h-12 w-full mt-4 shadow-indigo-200"
                                     >
                                         {isParsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-                                        <span className="text-sm">Analyze & Preview</span>
+                                        <span className="text-sm">Open Preview & Edit</span>
                                     </button>
                                 )}
                             </div>
@@ -483,9 +595,9 @@ const JsonExcelConverter: React.FC = () => {
                     <div className="flex items-center justify-between px-1">
                         <div>
                             <h2 className="text-xl font-bold text-gray-900 tracking-tight">
-                                Transformed View {totalRows !== null && <span className="text-indigo-600 ml-2 opacity-50 font-normal">({totalRows} Records)</span>}
+                                Preview Workspace {activeTotalRows !== null && <span className="text-indigo-600 ml-2 opacity-50 font-normal">({activeTotalRows} Records)</span>}
                             </h2>
-                            <p className="text-xs text-gray-500 font-medium uppercase tracking-widest mt-0.5">Editable Workspace</p>
+                            <p className="text-xs text-gray-500 font-medium uppercase tracking-widest mt-0.5">Review Before Export</p>
                         </div>
                         <div className="flex items-center gap-2">
                             <div className="bg-gray-100/80 p-1.5 rounded-2xl flex items-center border border-gray-200/50 shadow-inner">
@@ -526,38 +638,76 @@ const JsonExcelConverter: React.FC = () => {
                                     <div className="absolute inset-0 blur-xl bg-indigo-400/20 animate-pulse" />
                                 </div>
                                 <p className="text-sm font-black text-gray-900 tracking-[0.2em] uppercase">Processing Data Stream</p>
+                                <div className="w-[280px] space-y-2">
+                                    <div className="h-2 w-full rounded-full bg-slate-200 overflow-hidden">
+                                        <div className="h-full bg-indigo-600 transition-all duration-200" style={{ width: `${previewProgressPct}%` }} />
+                                    </div>
+                                    <p className="text-xs font-semibold text-slate-600 text-center">
+                                        Preview {previewLoadedRows.toLocaleString()} / {previewTargetRows.toLocaleString()} rows
+                                        {activeTotalRows ? ` • Total ${activeTotalRows.toLocaleString()} rows` : ''}
+                                    </p>
+                                    <p className="text-[11px] font-medium text-slate-500 text-center">
+                                        {previewRowsPerSec > 0 ? `${previewRowsPerSec.toLocaleString()} rows/s` : 'Calculating speed...'}
+                                        {previewEtaLabel && previewRemainingRows > 0 ? ` • ETA ${previewEtaLabel}` : ''}
+                                    </p>
+                                    <div className="flex justify-center">
+                                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${etaConfidence === 'Stable'
+                                            ? 'bg-emerald-100 text-emerald-700'
+                                            : 'bg-amber-100 text-amber-700'
+                                            }`}>
+                                            ETA {etaConfidence}
+                                        </span>
+                                    </div>
+                                </div>
                             </div>
                         )}
 
                         {viewType === 'table' ? (
                             <div className="h-full animate-in fade-in zoom-in-95 duration-700">
-                                {tableData.length > 0 ? (
+                                {activeTableData.length > 0 ? (
                                     <TanStackDataTable
-                                        data={tableData}
+                                        data={activeTableData}
                                         onDataChange={(newData) => {
-                                            setTableData(newData);
+                                            setPreviewRows(newData);
                                             setIsDirty(true);
                                         }}
                                     />
                                 ) : (
-                                    <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-4">
-                                        <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center border border-gray-100">
-                                            <TableIcon className="w-8 h-8 opacity-20" />
+                                    <div className="h-full flex items-center justify-center p-6">
+                                        <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white/85 p-5 shadow-sm">
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-11 h-11 bg-slate-50 rounded-xl flex items-center justify-center border border-slate-200">
+                                                    <TableIcon className="w-5 h-5 text-slate-500" />
+                                                </div>
+                                                <div>
+                                                    <p className="text-sm font-bold text-slate-900">No preview opened</p>
+                                                    <p className="text-xs text-slate-600">Convert directly, or review before export.</p>
+                                                </div>
+                                            </div>
+                                            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                                                <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2">
+                                                    <p className="font-semibold text-emerald-800">Default action</p>
+                                                    <p className="text-emerald-700">Use Convert & Export</p>
+                                                </div>
+                                                <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2">
+                                                    <p className="font-semibold text-indigo-800">Before exporting</p>
+                                                    <p className="text-indigo-700">Open Preview & Edit if needed</p>
+                                                </div>
+                                            </div>
                                         </div>
-                                        <p className="text-sm font-bold tracking-tight">Input data to generate preview</p>
                                     </div>
                                 )}
                             </div>
                         ) : (
                             <div className="h-full overflow-auto custom-scrollbar bg-gray-900 animate-in fade-in duration-500">
                                 <pre className="font-mono text-[13px] text-gray-300 p-8 min-w-full leading-relaxed selection:bg-indigo-500/30">
-                                    {totalRows && totalRows > 1000 && (
+                                    {activeTotalRows && activeTotalRows > 1000 && (
                                         <div className="mb-6 p-4 bg-indigo-600/10 border border-indigo-500/20 rounded-2xl text-indigo-400 font-bold text-xs flex items-center space-x-3">
                                             <AlertCircle className="w-4 h-4" />
                                             <span>Displaying head (1,000 records) for low-latency scrolling. Export will contain full dataset.</span>
                                         </div>
                                     )}
-                                    {jsonPreviewText || '// No data transformed yet. Use Compute Table to begin.'}
+                                    {jsonPreviewText || '// No preview opened. Use Convert & Export, or open Preview & Edit first.'}
                                 </pre>
                             </div>
                         )}

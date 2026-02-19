@@ -48,8 +48,6 @@ interface DiffCheckerState {
 interface JsonExcelState {
     /** Raw JSON or Excel data as string */
     inputData: string;
-    /** Parsed table data for preview */
-    tableData: any[];
     /** Uploaded Excel file reference */
     file: File | null;
     /** Current conversion direction */
@@ -70,8 +68,6 @@ interface JsonExcelState {
 interface JsonCsvState {
     /** Raw JSON or CSV data as string */
     inputData: string;
-    /** Parsed table data for preview */
-    tableData: any[];
     /** Uploaded CSV file reference */
     file: File | null;
     /** Current conversion direction */
@@ -106,8 +102,6 @@ interface WordPdfState {
 interface ExcelCsvState {
     /** Uploaded Excel or CSV file */
     file: File | null;
-    /** Parsed table data for preview */
-    tableData: any[];
     /** Total rows in the dataset */
     totalRows: number | null;
     /** Original filename */
@@ -212,7 +206,6 @@ const initialDiffChecker: DiffCheckerState = {
 
 const initialJsonExcel: JsonExcelState = {
     inputData: '',
-    tableData: [],
     file: null,
     mode: 'json-to-excel',
     totalRows: null,
@@ -223,7 +216,6 @@ const initialJsonExcel: JsonExcelState = {
 
 const initialJsonCsv: JsonCsvState = {
     inputData: '',
-    tableData: [],
     file: null,
     mode: 'json-to-csv',
     totalRows: null,
@@ -241,7 +233,6 @@ const initialWordPdf: WordPdfState = {
 
 const initialExcelCsv: ExcelCsvState = {
     file: null,
-    tableData: [],
     totalRows: null,
     fileName: '',
     isDirty: false,

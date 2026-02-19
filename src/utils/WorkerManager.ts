@@ -79,11 +79,20 @@ export class WorkerManager<TRequest = unknown, TResponse = unknown> {
 
             if (id) {
                 // Handle Progress Events
-                if (type === 'PROGRESS') {
+                if (type === 'PROGRESS' || type === 'PREVIEW_CHUNK') {
                     const progressHandler = this.progressHandlers.get(id);
                     if (progressHandler) {
                         progressHandler(payload);
                     }
+                    return;
+                }
+
+                if (type === 'PREVIEW_COMPLETE') {
+                    const handler = this.messageHandlers.get(id);
+                    handler?.(payload);
+                    this.messageHandlers.delete(id);
+                    this.errorHandlers.delete(id);
+                    this.progressHandlers.delete(id);
                     return;
                 }
 

@@ -19,10 +19,14 @@ import { copyToClipboard, formatFileSize } from '../../utils/jsonUtils';
 import { useAppStore } from '../../store/AppContext';
 import AppLoader from '../../components/AppLoader';
 import { logger } from '../../utils/logger';
+import { useDraftPreference } from '../../hooks/useDraftPreference';
+import { DRAFT_TTL_MS, loadDraftWithStatus, saveDraft, clearDraft } from '../../utils/draftStorage';
 
 const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 const VirtualizedJsonTree = lazy(() => import('../../components/VirtualizedJsonTree'));
 type JsonSearchResult = { paths: string[]; count: number };
+type JsonViewerDraft = { jsonInput: string };
+const JSON_VIEWER_DRAFT_KEY = 'json-viewer';
 
 const containerMotion = {
     hidden: { opacity: 0, y: 8 },
@@ -81,6 +85,8 @@ const JsonViewer: React.FC = () => {
     const [searchCount, setSearchCount] = useState<number | null>(null);
     const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set(['root']));
     const [isCopied, setIsCopied] = useState(false);
+    const [draftNotice, setDraftNotice] = useState<string | null>(null);
+    const { enabled: draftsEnabled } = useDraftPreference();
 
     const workerRef = useRef<WorkerManager<unknown, unknown> | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -102,6 +108,47 @@ const JsonViewer: React.FC = () => {
             workerRef.current = null;
         };
     }, []);
+
+    useEffect(() => {
+        if (!draftsEnabled) return;
+        const { data: draft, expired } = loadDraftWithStatus<JsonViewerDraft>(JSON_VIEWER_DRAFT_KEY);
+        if (expired) {
+            setDraftNotice(`Session expired (${Math.round(DRAFT_TTL_MS / 60000)} min). Draft cleared.`);
+            const timer = window.setTimeout(() => setDraftNotice(null), 2000);
+            return () => window.clearTimeout(timer);
+        }
+        if (!draft?.jsonInput) return;
+        setJsonViewer({
+            jsonInput: draft.jsonInput,
+            rawFile: null,
+            isDirectMode: false,
+            fileInfo: null,
+        });
+        setDraftNotice('Draft restored');
+        const timer = window.setTimeout(() => setDraftNotice(null), 1600);
+        return () => window.clearTimeout(timer);
+    }, [draftsEnabled, setJsonViewer]);
+
+    useEffect(() => {
+        if (!draftsEnabled) return;
+        const timer = window.setTimeout(() => {
+            saveDraft<JsonViewerDraft>(JSON_VIEWER_DRAFT_KEY, { jsonInput });
+        }, 800);
+        return () => window.clearTimeout(timer);
+    }, [draftsEnabled, jsonInput]);
+
+    useEffect(() => {
+        if (draftsEnabled) return;
+        const hasUnsavedData = Boolean(jsonInput.trim() || rawFile || jsonTree);
+        if (!hasUnsavedData) return;
+
+        const handler = (event: BeforeUnloadEvent) => {
+            event.preventDefault();
+            event.returnValue = '';
+        };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, [draftsEnabled, jsonInput, rawFile, jsonTree]);
 
     // Stable Parse Handler
     const handleToggle = useCallback((path: string) => {
@@ -244,6 +291,10 @@ const JsonViewer: React.FC = () => {
     };
 
     const handleClear = () => {
+        const hasData = Boolean(jsonInput.trim() || rawFile || jsonTree);
+        if (hasData && !window.confirm('Clear current JSON data?')) {
+            return;
+        }
         if (isLoading) {
             setTaskStatus({ state: 'cancelled', label: 'JSON parse cancelled' });
         }
@@ -257,6 +308,7 @@ const JsonViewer: React.FC = () => {
         setSearchCount(null);
         searchSeqRef.current += 1;
         if (fileInputRef.current) fileInputRef.current.value = '';
+        clearDraft(JSON_VIEWER_DRAFT_KEY);
     };
 
     const handleCopyJson = useCallback(async () => {
@@ -304,6 +356,11 @@ const JsonViewer: React.FC = () => {
                     {fileInfo && <span className="text-[11px] font-semibold bg-indigo-50/90 border border-indigo-100 text-indigo-700 px-2 py-0.5 rounded-md shrink-0">{formatFileSize(fileInfo.size)}</span>}
                 </div>
                 <span className="hidden md:inline text-[11px] font-semibold text-slate-400 shrink-0">Client-side processing</span>
+                {draftNotice && (
+                    <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-md">
+                        {draftNotice}
+                    </span>
+                )}
             </motion.div>
 
             <div className="flex-1 grid grid-cols-1 xl:grid-cols-2 gap-3 sm:gap-4 min-h-0 overflow-hidden">
@@ -463,11 +520,22 @@ const JsonViewer: React.FC = () => {
                                     />
                                 </Suspense>
                             ) : (
-                                <div className="h-full flex flex-col items-center justify-center text-slate-400 gap-3 subtle-grid rounded-lg">
-                                    <div className="w-16 h-16 bg-white/90 rounded-2xl flex items-center justify-center border border-slate-200">
-                                        <FileJson className="w-8 h-8 opacity-20" />
+                                <div className="h-full flex flex-col items-center justify-center subtle-grid rounded-xl p-6 text-center">
+                                    <div className="w-14 h-14 bg-white/90 rounded-2xl flex items-center justify-center border border-slate-200 shadow-sm">
+                                        <FileJson className="w-7 h-7 text-indigo-500/70" />
                                     </div>
-                                    <p className="text-sm font-semibold">Structured view will appear here after visualization</p>
+                                    <p className="mt-4 text-base font-bold text-slate-900">Structured view is ready</p>
+                                    <p className="mt-1 text-sm text-slate-600 max-w-md">
+                                        Click Visualize to load and explore your JSON tree.
+                                    </p>
+                                    <button
+                                        onClick={() => handleParse()}
+                                        disabled={!jsonInput.trim() && !rawFile}
+                                        className="mt-4 btn-primary h-9 px-4 disabled:opacity-50"
+                                    >
+                                        <Wand2 className="w-4 h-4" />
+                                        <span className="text-sm font-semibold">Visualize Now</span>
+                                    </button>
                                 </div>
                             )}
                         </div>

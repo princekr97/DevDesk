@@ -12,6 +12,13 @@ export interface WorkerResponse<T = unknown> {
     error?: string;
 }
 
+export interface PreviewChunkPayload<T = unknown> {
+    chunk: T[];
+    chunkIndex: number;
+    totalRows?: number;
+    done?: boolean;
+}
+
 export type WorkerMessageHandler<T = unknown, R = unknown> = (
     payload: T
 ) => R | Promise<R>;

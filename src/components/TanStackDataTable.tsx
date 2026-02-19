@@ -33,12 +33,17 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
     const [headerValue, setHeaderValue] = useState<string>('');
     const [scrollTop, setScrollTop] = useState(0);
     const [viewportHeight, setViewportHeight] = useState(640);
+    const [draftEdits, setDraftEdits] = useState<Record<string, string>>({});
 
     const parentRef = useRef<HTMLDivElement>(null);
+    const scrollRafRef = useRef<number | null>(null);
+    const pendingScrollTopRef = useRef(0);
+    const changeDebounceRef = useRef<number | null>(null);
 
     // Sync data when initialData changes
     React.useEffect(() => {
         setData(initialData);
+        setDraftEdits({});
     }, [initialData]);
 
     const effectiveData = useMemo(() => {
@@ -54,12 +59,23 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         );
     }, [effectiveData]);
 
-    // Handle cell change
-    const handleCellChange = (rowIndex: number, columnId: string, value: string) => {
+    const queueDataChange = React.useCallback((nextData: any[]) => {
+        if (!onDataChange) return;
+        if (changeDebounceRef.current !== null) {
+            clearTimeout(changeDebounceRef.current);
+        }
+        changeDebounceRef.current = window.setTimeout(() => {
+            onDataChange(nextData);
+            changeDebounceRef.current = null;
+        }, 120);
+    }, [onDataChange]);
+
+    // Handle cell commit
+    const handleCellCommit = (rowIndex: number, columnId: string, value: string) => {
         const newData = [...data];
         newData[rowIndex] = { ...newData[rowIndex], [columnId]: value };
         setData(newData);
-        onDataChange?.(newData);
+        queueDataChange(newData);
     };
 
     // Handle header rename
@@ -75,7 +91,7 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         });
 
         setData(newData);
-        onDataChange?.(newData);
+        queueDataChange(newData);
         onHeaderChange?.(oldName, newName);
         setEditingHeader(null);
     };
@@ -84,7 +100,7 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
     const handleDeleteRow = (rowIndex: number) => {
         const newData = data.filter((_, i) => i !== rowIndex);
         setData(newData);
-        onDataChange?.(newData);
+        queueDataChange(newData);
     };
 
     // Handle add row
@@ -92,7 +108,7 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         const newRow = headers.reduce((acc, header) => ({ ...acc, [header]: '' }), {});
         const newData = [...data, newRow];
         setData(newData);
-        onDataChange?.(newData);
+        queueDataChange(newData);
     };
 
     // Define columns
@@ -152,7 +168,9 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
                 ),
                 cell: ({ getValue, row, column }) => {
                     const value = getValue();
-                    const displayValue = value === null ? 'null' : (typeof value === 'object' ? JSON.stringify(value) : String(value ?? ''));
+                    const cellKey = `${row.index}:${column.id}`;
+                    const rawValue = value === null ? 'null' : (typeof value === 'object' ? JSON.stringify(value) : String(value ?? ''));
+                    const displayValue = draftEdits[cellKey] ?? rawValue;
 
                     return (
                         <div className="flex items-start group/cell w-full">
@@ -161,7 +179,41 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
                                     <input
                                         type="text"
                                         value={displayValue}
-                                        onChange={(e) => handleCellChange(row.index, column.id, e.target.value)}
+                                        onChange={(e) => {
+                                            const nextValue = e.target.value;
+                                            setDraftEdits((prev) => ({ ...prev, [cellKey]: nextValue }));
+                                        }}
+                                        onBlur={() => {
+                                            const draftValue = draftEdits[cellKey];
+                                            if (draftValue !== undefined && draftValue !== rawValue) {
+                                                handleCellCommit(row.index, column.id, draftValue);
+                                            }
+                                            setDraftEdits((prev) => {
+                                                const next = { ...prev };
+                                                delete next[cellKey];
+                                                return next;
+                                            });
+                                        }}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter') {
+                                                const draftValue = draftEdits[cellKey] ?? rawValue;
+                                                if (draftValue !== rawValue) {
+                                                    handleCellCommit(row.index, column.id, draftValue);
+                                                }
+                                                setDraftEdits((prev) => {
+                                                    const next = { ...prev };
+                                                    delete next[cellKey];
+                                                    return next;
+                                                });
+                                                (e.currentTarget as HTMLInputElement).blur();
+                                            } else if (e.key === 'Escape') {
+                                                setDraftEdits((prev) => {
+                                                    const next = { ...prev };
+                                                    delete next[cellKey];
+                                                    return next;
+                                                });
+                                            }
+                                        }}
                                         className="w-full bg-transparent border border-transparent focus:border-indigo-300 focus:bg-white focus:shadow-sm rounded-lg px-2 py-1.5 -mx-2 transition-all min-h-[34px]"
                                     />
                                     <Edit3 className="w-3 h-3 text-indigo-400 opacity-0 group-hover/cell:opacity-100 absolute right-2 top-3 pointer-events-none" />
@@ -196,7 +248,7 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         }
 
         return cols;
-    }, [headers, editingHeader, headerValue, isEditable]);
+    }, [headers, editingHeader, headerValue, isEditable, draftEdits, queueDataChange, data]);
 
     // Create table instance
     const table = useReactTable({
@@ -246,6 +298,26 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         return () => observer.disconnect();
     }, []);
 
+    useEffect(() => {
+        return () => {
+            if (scrollRafRef.current !== null) {
+                cancelAnimationFrame(scrollRafRef.current);
+            }
+            if (changeDebounceRef.current !== null) {
+                clearTimeout(changeDebounceRef.current);
+            }
+        };
+    }, []);
+
+    const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+        pendingScrollTopRef.current = e.currentTarget.scrollTop;
+        if (scrollRafRef.current !== null) return;
+        scrollRafRef.current = requestAnimationFrame(() => {
+            setScrollTop((prev) => (prev !== pendingScrollTopRef.current ? pendingScrollTopRef.current : prev));
+            scrollRafRef.current = null;
+        });
+    };
+
     if (!data || !Array.isArray(data)) {
         return (
             <div className="h-full flex items-center justify-center text-gray-400 italic font-medium">
@@ -258,7 +330,7 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         <div className="w-full h-full flex flex-col overflow-hidden bg-white/50 backdrop-blur-md border border-gray-100/50">
             <div
                 ref={parentRef}
-                onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+                onScroll={handleScroll}
                 className="flex-1 overflow-x-auto overflow-y-auto relative w-full custom-scrollbar"
                 style={{ WebkitOverflowScrolling: 'touch' }}
             >

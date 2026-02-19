@@ -49,4 +49,16 @@ export const CONVERTER_LIMITS = {
 
     /** Threshold for worker-based processing */
     WORKER_THRESHOLD_ROWS: 500,
+
+    /** Safe mode threshold for file-based preview (bytes) */
+    SAFE_MODE_PREVIEW_FILE_BYTES: 8 * 1024 * 1024, // 8 MB
+
+    /** Hard guard: maximum supported rows per conversion request */
+    MAX_ROWS: 100000,
+
+    /** Hard guard: maximum supported columns per conversion request */
+    MAX_COLUMNS: 500,
+
+    /** Hard guard: maximum serialized value length per cell */
+    MAX_CELL_CHARS: 200000,
 } as const;

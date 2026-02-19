@@ -44,38 +44,40 @@ const VirtualizedJsonTree: React.FC<VirtualizedJsonTreeProps> = ({
     const containerRef = React.useRef<HTMLDivElement>(null);
     const [scrollTop, setScrollTop] = React.useState(0);
     const [viewportHeight, setViewportHeight] = React.useState(600);
+    const resizeRafRef = React.useRef<number | null>(null);
+    const scrollRafRef = React.useRef<number | null>(null);
+    const pendingScrollTopRef = React.useRef(0);
 
     const expandedPaths = externalExpandedPaths || internalExpandedPaths;
 
-    // Update viewport height with loop protection
+    // Observe container size and batch height updates on animation frame.
     React.useEffect(() => {
-        if (!containerRef.current) return;
+        const container = containerRef.current;
+        if (!container) return;
 
-        let animationFrameId: number;
         const resizeObserver = new ResizeObserver((entries) => {
-            // 1. Stop observing to prevent loop
-            resizeObserver.disconnect();
+            const nextHeight = entries[0]?.contentRect.height;
+            if (!nextHeight) return;
 
-            // 2. Schedule update
-            animationFrameId = requestAnimationFrame(() => {
-                if (entries[0]) {
-                    const newHeight = entries[0].contentRect.height;
-                    // Only update if height actually changed (prevent phantom updates)
-                    setViewportHeight(prev => Math.abs(prev - newHeight) > 1 ? newHeight : prev);
-                }
-
-                // 3. Re-observe
-                if (containerRef.current) {
-                    resizeObserver.observe(containerRef.current);
-                }
+            if (resizeRafRef.current !== null) {
+                cancelAnimationFrame(resizeRafRef.current);
+            }
+            resizeRafRef.current = requestAnimationFrame(() => {
+                setViewportHeight(prev => (Math.abs(prev - nextHeight) > 1 ? nextHeight : prev));
+                resizeRafRef.current = null;
             });
         });
 
-        resizeObserver.observe(containerRef.current);
+        resizeObserver.observe(container);
 
         return () => {
             resizeObserver.disconnect();
-            cancelAnimationFrame(animationFrameId);
+            if (resizeRafRef.current !== null) {
+                cancelAnimationFrame(resizeRafRef.current);
+            }
+            if (scrollRafRef.current !== null) {
+                cancelAnimationFrame(scrollRafRef.current);
+            }
         };
     }, []);
 
@@ -166,14 +168,24 @@ const VirtualizedJsonTree: React.FC<VirtualizedJsonTreeProps> = ({
         }
     };
 
-    const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
-        setScrollTop(e.currentTarget.scrollTop);
-    };
+    const handleScroll = React.useCallback((e: React.UIEvent<HTMLDivElement>) => {
+        pendingScrollTopRef.current = e.currentTarget.scrollTop;
+        if (scrollRafRef.current !== null) return;
+
+        scrollRafRef.current = requestAnimationFrame(() => {
+            setScrollTop(prev => (prev !== pendingScrollTopRef.current ? pendingScrollTopRef.current : prev));
+            scrollRafRef.current = null;
+        });
+    }, []);
 
     // Virtualization calculations
     const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 5);
     const endIndex = Math.min(visibleNodes.length, Math.floor((scrollTop + viewportHeight) / ROW_HEIGHT) + 5);
     const totalHeight = visibleNodes.length * ROW_HEIGHT;
+    const windowedNodes = React.useMemo(
+        () => visibleNodes.slice(startIndex, endIndex),
+        [visibleNodes, startIndex, endIndex]
+    );
 
     const searchRegex = React.useMemo(() => {
         if (!searchQuery) return null;
@@ -219,7 +231,7 @@ const VirtualizedJsonTree: React.FC<VirtualizedJsonTreeProps> = ({
             className="w-full h-full overflow-auto custom-scrollbar relative"
         >
             <div style={{ height: totalHeight, minWidth: '100%', width: 'max-content', position: 'relative' }}>
-                {visibleNodes.slice(startIndex, endIndex).map((flatNode, i) => {
+                {windowedNodes.map((flatNode, i) => {
                     const actualIndex = startIndex + i;
                     const { node, depth, hasChildren, path } = flatNode;
                     const isExpanded = defaultExpanded || expandedPaths.has(path);
@@ -227,7 +239,7 @@ const VirtualizedJsonTree: React.FC<VirtualizedJsonTreeProps> = ({
                     return (
                         <div
                             key={path}
-                            className="absolute left-0 min-w-full w-max flex items-center group hover:bg-indigo-50/30 px-2 rounded-lg transition-colors font-mono text-xs border border-transparent hover:border-indigo-100/30 will-change-transform"
+                            className="absolute left-0 min-w-full w-max flex items-center group hover:bg-indigo-50/30 px-2 rounded-lg transition-colors font-mono text-xs border border-transparent hover:border-indigo-100/30"
                             style={{
                                 top: 0,
                                 transform: `translateY(${actualIndex * ROW_HEIGHT}px)`,

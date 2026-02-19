@@ -12,14 +12,38 @@ import { useAppStore } from '../../store/AppContext';
 import { WorkerManager } from '../../utils/WorkerManager';
 import FileUploader from '../../components/FileUploader';
 import TanStackDataTable from '../../components/TanStackDataTable';
+import { perfMark, perfMeasure } from '../../utils/perf';
+import { CONVERTER_LIMITS } from '../../constants';
 
 const ExcelCsvConverter: React.FC = () => {
     const { state, setExcelCsv, setTaskStatus } = useAppStore();
-    const { file, tableData, totalRows, fileName, isDirty, isParsing } = state.excelCsv;
+    const { file, totalRows, fileName, isDirty, isParsing } = state.excelCsv;
 
     const [error, setError] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [saveMode, setSaveMode] = useState<'csv' | 'xlsx'>('csv');
+    const [previewRows, setPreviewRows] = useState<any[]>([]);
+    const [previewTotalRows, setPreviewTotalRows] = useState<number | null>(totalRows);
+    const [previewStartedAt, setPreviewStartedAt] = useState<number | null>(null);
+    const activeTableData = previewRows;
+    const activeTotalRows = previewTotalRows ?? totalRows;
+    const previewTargetRows = Math.min(activeTotalRows ?? 1000, 1000);
+    const previewLoadedRows = Math.min(previewRows.length, previewTargetRows);
+    const previewProgressPct = previewTargetRows > 0
+        ? Math.min(100, Math.round((previewLoadedRows / previewTargetRows) * 100))
+        : 0;
+    const elapsedSeconds = previewStartedAt ? Math.max((Date.now() - previewStartedAt) / 1000, 0.001) : 0;
+    const previewRowsPerSec = previewLoadedRows > 0 && elapsedSeconds > 0 ? Math.round(previewLoadedRows / elapsedSeconds) : 0;
+    const previewRemainingRows = Math.max(previewTargetRows - previewLoadedRows, 0);
+    const previewEtaSeconds = previewRowsPerSec > 0 ? Math.ceil(previewRemainingRows / previewRowsPerSec) : null;
+    const previewEtaLabel = previewEtaSeconds === null
+        ? null
+        : previewEtaSeconds < 60
+            ? `${previewEtaSeconds}s`
+            : `${Math.floor(previewEtaSeconds / 60)}m ${previewEtaSeconds % 60}s`;
+    const etaConfidence = previewRowsPerSec > 0 && previewLoadedRows >= 300 && elapsedSeconds >= 2 ? 'Stable' : 'Calibrating';
+    const previewSafeModeActive = Boolean(file && file.size > CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES);
+    const safeModeLimitMb = Math.round(CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES / (1024 * 1024));
 
     const excelWorkerRef = useRef<WorkerManager<any, any> | null>(null);
     const csvWorkerRef = useRef<WorkerManager<any, any> | null>(null);
@@ -46,21 +70,36 @@ const ExcelCsvConverter: React.FC = () => {
         };
     }, []);
 
+    useEffect(() => {
+        setPreviewTotalRows(totalRows);
+    }, [totalRows]);
+
     const handleFileSelect = async (selectedFile: File) => {
         setExcelCsv({ file: selectedFile, fileName: selectedFile.name, isDirty: false });
         setError(null);
-        setExcelCsv({ tableData: [] });
+        setPreviewRows([]);
+        setPreviewTotalRows(null);
+        setPreviewStartedAt(null);
     };
 
     const handlePreview = async () => {
         if (!file) return;
+        if (previewSafeModeActive) {
+            setError(`Preview is disabled in Safe Mode for files above ${safeModeLimitMb}MB. Use Convert & Export.`);
+            return;
+        }
 
+        perfMark('excel-csv-preview-start');
+        setPreviewStartedAt(Date.now());
         setExcelCsv({ isParsing: true });
         setError(null);
         setTaskStatus({ state: 'running', label: 'Preparing preview' });
         excelWorkerRef.current?.cancelAll('Superseded by a newer preview request');
         csvWorkerRef.current?.cancelAll('Superseded by a newer preview request');
         initWorkers();
+        setPreviewRows([]);
+        setPreviewTotalRows(null);
+        setExcelCsv({ totalRows: null });
 
         // Add timeout protection
         const timeoutId = setTimeout(() => {
@@ -71,46 +110,65 @@ const ExcelCsvConverter: React.FC = () => {
         try {
             const extension = file.name.split('.').pop()?.toLowerCase();
             const buffer = await file.arrayBuffer();
+            const collectedRows: any[] = [];
+            let collectedTotalRows = 0;
+            let firstChunkMeasured = false;
 
             if (extension === 'xlsx' || extension === 'xls') {
-                const result = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                await excelWorkerRef.current!.postMessage('PREVIEW_EXCEL_STREAM', {
                     data: buffer,
-                    type: 'excel-to-json',
                     options: { flatten: true }
-                }, [buffer], 0);
-
-                const data = Array.isArray(result.data) ? result.data : [result.data];
-
-                if (!data || data.length === 0) {
-                    throw new Error('No data found in Excel file');
-                }
-
-                setExcelCsv({
-                    tableData: data.slice(0, 1000),
-                    totalRows: data.length,
-                    isParsing: false
+                }, [buffer], 0, (progressData) => {
+                    const payload = progressData as { chunk?: any[]; totalRows?: number };
+                    const chunk = Array.isArray(payload?.chunk) ? payload.chunk : [];
+                    if (chunk.length > 0 && !firstChunkMeasured) {
+                        perfMark('excel-csv-preview-first-chunk');
+                        perfMeasure('excel-csv-first-preview', 'excel-csv-preview-start', 'excel-csv-preview-first-chunk');
+                        firstChunkMeasured = true;
+                    }
+                    if (chunk.length > 0) {
+                        collectedRows.push(...chunk);
+                        setPreviewRows((prev) => [...prev, ...chunk]);
+                    }
+                    if (typeof payload?.totalRows === 'number') {
+                        collectedTotalRows = payload.totalRows;
+                        setPreviewTotalRows(payload.totalRows);
+                    }
                 });
             } else if (extension === 'csv') {
-                const result = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
+                await csvWorkerRef.current!.postMessage('PREVIEW_CSV_STREAM', {
                     data: buffer,
-                    type: 'csv-to-json'
-                }, [buffer], 0);
-
-                const data = Array.isArray(result) ? result : [result];
-
-                if (!data || data.length === 0) {
-                    throw new Error('No data found in CSV file');
-                }
-
-                setExcelCsv({
-                    tableData: data.slice(0, 1000),
-                    totalRows: data.length,
-                    isParsing: false
+                }, [buffer], 0, (progressData) => {
+                    const payload = progressData as { chunk?: any[]; totalRows?: number };
+                    const chunk = Array.isArray(payload?.chunk) ? payload.chunk : [];
+                    if (chunk.length > 0 && !firstChunkMeasured) {
+                        perfMark('excel-csv-preview-first-chunk');
+                        perfMeasure('excel-csv-first-preview', 'excel-csv-preview-start', 'excel-csv-preview-first-chunk');
+                        firstChunkMeasured = true;
+                    }
+                    if (chunk.length > 0) {
+                        collectedRows.push(...chunk);
+                        setPreviewRows((prev) => [...prev, ...chunk]);
+                    }
+                    if (typeof payload?.totalRows === 'number') {
+                        collectedTotalRows = payload.totalRows;
+                        setPreviewTotalRows(payload.totalRows);
+                    }
                 });
             } else {
                 throw new Error('Unsupported file format. Please upload XLSX or CSV.');
             }
 
+            if (collectedRows.length === 0) {
+                throw new Error('No data found in file');
+            }
+
+            setExcelCsv({
+                totalRows: collectedTotalRows || collectedRows.length,
+                isParsing: false
+            });
+            perfMark('excel-csv-preview-complete');
+            perfMeasure('excel-csv-preview-total', 'excel-csv-preview-start', 'excel-csv-preview-complete');
             clearTimeout(timeoutId);
             setTaskStatus({ state: 'done', label: 'Preview ready' });
         } catch (err) {
@@ -118,14 +176,19 @@ const ExcelCsvConverter: React.FC = () => {
             setError(err instanceof Error ? err.message : 'Failed to parse file');
             setExcelCsv({ isParsing: false });
             setTaskStatus({ state: 'error', label: 'Preview failed' });
+            setPreviewStartedAt(null);
         }
     };
 
     const handleSave = async () => {
-        if (tableData.length === 0) return;
+        if (!file) {
+            setError('Please upload a file first');
+            return;
+        }
 
         setIsLoading(true);
         setError(null);
+        perfMark('excel-csv-export-start');
         setTaskStatus({ state: 'running', label: `Exporting ${saveMode.toUpperCase()}` });
         excelWorkerRef.current?.cancelAll('Superseded by a newer export request');
         csvWorkerRef.current?.cancelAll('Superseded by a newer export request');
@@ -138,12 +201,92 @@ const ExcelCsvConverter: React.FC = () => {
         }, 60000); // 60 second timeout
 
         try {
-            const baseName = fileName.split('.')[0];
+            const sourceExtension = file.name.split('.').pop()?.toLowerCase();
+            const baseName = fileName.split('.')[0] || file.name.split('.')[0];
             const timestamp = Date.now();
 
-            if (saveMode === 'csv') {
+            if (activeTableData.length === 0) {
+                const sourceBuffer = await file.arrayBuffer();
+
+                if (saveMode === 'csv') {
+                    if (sourceExtension === 'csv') {
+                        const blob = new Blob([sourceBuffer], { type: 'text/csv;charset=utf-8;' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${baseName}_converted_${timestamp}.csv`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    } else {
+                        const parsed = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                            data: sourceBuffer,
+                            type: 'excel-to-json'
+                        }, [sourceBuffer], 0);
+
+                        const csvResult = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
+                            data: JSON.stringify(parsed.data),
+                            type: 'json-to-csv'
+                        }, undefined, 0);
+
+                        const blob = new Blob([csvResult], { type: 'text/csv;charset=utf-8;' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${baseName}_converted_${timestamp}.csv`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    }
+                } else {
+                    if (sourceExtension === 'xlsx') {
+                        const blob = new Blob([sourceBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${baseName}_converted_${timestamp}.xlsx`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    } else {
+                        let rows: any[] = [];
+
+                        if (sourceExtension === 'csv') {
+                            const parsed = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
+                                data: sourceBuffer,
+                                type: 'csv-to-json'
+                            }, [sourceBuffer], 0);
+                            rows = Array.isArray(parsed) ? parsed : [parsed];
+                        } else {
+                            const parsed = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                                data: sourceBuffer,
+                                type: 'excel-to-json'
+                            }, [sourceBuffer], 0);
+                            rows = Array.isArray(parsed.data) ? parsed.data : [parsed.data];
+                        }
+
+                        const excelResult = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                            data: JSON.stringify(rows),
+                            type: 'json-to-excel'
+                        }, undefined, 0);
+
+                        const blob = new Blob([excelResult.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${baseName}_converted_${timestamp}.xlsx`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                    }
+                }
+            } else if (saveMode === 'csv') {
                 const result = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
-                    data: JSON.stringify(tableData),
+                    data: JSON.stringify(activeTableData),
                     type: 'json-to-csv'
                 }, undefined, 0);
 
@@ -158,7 +301,7 @@ const ExcelCsvConverter: React.FC = () => {
                 URL.revokeObjectURL(url);
             } else {
                 const result = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
-                    data: JSON.stringify(tableData),
+                    data: JSON.stringify(activeTableData),
                     type: 'json-to-excel'
                 }, undefined, 0);
 
@@ -173,6 +316,8 @@ const ExcelCsvConverter: React.FC = () => {
                 URL.revokeObjectURL(url);
             }
 
+            perfMark('excel-csv-export-complete');
+            perfMeasure('excel-csv-export-total', 'excel-csv-export-start', 'excel-csv-export-complete');
             clearTimeout(timeoutId);
             setTaskStatus({ state: 'done', label: 'Export complete' });
         } catch (err) {
@@ -189,12 +334,14 @@ const ExcelCsvConverter: React.FC = () => {
         csvWorkerRef.current?.cancelAll('Cleared by user');
         setExcelCsv({
             file: null,
-            tableData: [],
             totalRows: null,
             fileName: '',
             isDirty: false,
             isParsing: false,
         });
+        setPreviewRows([]);
+        setPreviewTotalRows(null);
+        setPreviewStartedAt(null);
         setError(null);
     };
 
@@ -203,8 +350,11 @@ const ExcelCsvConverter: React.FC = () => {
         csvWorkerRef.current?.cancelAll('Cancelled by user');
         setExcelCsv({ isParsing: false });
         setIsLoading(false);
+        setPreviewStartedAt(null);
         setTaskStatus({ state: 'cancelled', label: 'Operation cancelled' });
     }, [setExcelCsv, setTaskStatus]);
+
+    const canPreview = Boolean(file) && !previewSafeModeActive;
 
     return (
         <div className="h-full flex flex-col space-y-6">
@@ -242,6 +392,14 @@ const ExcelCsvConverter: React.FC = () => {
                         <Trash2 className="w-4 h-4" />
                         <span className="text-sm font-bold">Reset</span>
                     </button>
+                    <button
+                        onClick={handlePreview}
+                        disabled={!canPreview || isParsing || isLoading}
+                        className="btn-secondary h-11 px-5 disabled:opacity-50"
+                    >
+                        {isParsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
+                        <span className="text-sm font-bold">Open Preview & Edit</span>
+                    </button>
                     {(isParsing || isLoading) && (
                         <button onClick={handleCancelCurrentTask} className="btn-secondary h-11 px-5">
                             <XCircle className="w-4 h-4 text-red-500" />
@@ -250,13 +408,28 @@ const ExcelCsvConverter: React.FC = () => {
                     )}
                     <button
                         onClick={handleSave}
-                        disabled={isLoading || tableData.length === 0}
+                        disabled={isLoading || !file}
                         className="btn-primary-gradient h-11 px-8 shadow-indigo-100"
                     >
                         {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-                        <span className="text-sm font-bold">Export Result</span>
+                        <span className="text-sm font-bold">Convert & Export</span>
                     </button>
                 </div>
+            </div>
+            <div className="mx-1 -mt-2 rounded-2xl border border-indigo-200/70 bg-gradient-to-r from-indigo-50 via-white to-cyan-50 px-4 py-3 shadow-sm">
+                <p className="text-[10px] font-black uppercase tracking-[0.16em] text-indigo-700">Workflow</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                    <span className="rounded-full bg-indigo-600 text-white px-3 py-1 font-bold">1. Convert & Export</span>
+                    <span className="rounded-full bg-white border border-indigo-200 text-indigo-700 px-3 py-1 font-semibold">2. Open Preview & Edit (if needed)</span>
+                </div>
+                <p className="mt-2 text-xs text-slate-700">
+                    Fastest path is direct export. Open preview only when you need to validate or edit rows.
+                </p>
+                {previewSafeModeActive && (
+                    <p className="mt-2 text-xs text-amber-700 font-semibold">
+                        Safe Mode active: preview is disabled for this large file to keep the app responsive.
+                    </p>
+                )}
             </div>
 
             {/* Main Content Area */}
@@ -286,11 +459,11 @@ const ExcelCsvConverter: React.FC = () => {
                             {file && (
                                 <button
                                     onClick={handlePreview}
-                                    disabled={isParsing}
+                                    disabled={!canPreview || isParsing || isLoading}
                                     className="btn-primary h-12 w-full mt-4 shadow-indigo-200"
                                 >
                                     {isParsing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-                                    <span className="text-sm">Compute Preview</span>
+                                    <span className="text-sm">Open Preview & Edit</span>
                                 </button>
                             )}
                         </div>
@@ -302,9 +475,9 @@ const ExcelCsvConverter: React.FC = () => {
                     <div className="flex items-center justify-between px-1">
                         <div>
                             <h2 className="text-xl font-bold text-gray-900 tracking-tight">
-                                Live Editor {totalRows !== null && <span className="text-indigo-600 ml-2 opacity-50 font-normal">({totalRows} Records)</span>}
+                                Preview Editor {activeTotalRows !== null && <span className="text-indigo-600 ml-2 opacity-50 font-normal">({activeTotalRows} Records)</span>}
                             </h2>
-                            <p className="text-xs text-gray-500 font-medium uppercase tracking-widest mt-0.5">Edit data before export</p>
+                            <p className="text-xs text-gray-500 font-medium uppercase tracking-widest mt-0.5">Review Before Export</p>
                         </div>
                         {isDirty && (
                             <span className="text-[10px] bg-amber-50 text-amber-600 border border-amber-100 px-3 py-1 rounded-full font-black tracking-widest animate-pulse">
@@ -321,23 +494,62 @@ const ExcelCsvConverter: React.FC = () => {
                                     <div className="absolute inset-0 blur-xl bg-indigo-400/20 animate-pulse" />
                                 </div>
                                 <p className="text-sm font-black text-gray-900 tracking-[0.2em] uppercase">Processing Data Stream</p>
+                                <div className="w-[280px] space-y-2">
+                                    <div className="h-2 w-full rounded-full bg-slate-200 overflow-hidden">
+                                        <div className="h-full bg-indigo-600 transition-all duration-200" style={{ width: `${previewProgressPct}%` }} />
+                                    </div>
+                                    <p className="text-xs font-semibold text-slate-600 text-center">
+                                        Preview {previewLoadedRows.toLocaleString()} / {previewTargetRows.toLocaleString()} rows
+                                        {activeTotalRows ? ` • Total ${activeTotalRows.toLocaleString()} rows` : ''}
+                                    </p>
+                                    <p className="text-[11px] font-medium text-slate-500 text-center">
+                                        {previewRowsPerSec > 0 ? `${previewRowsPerSec.toLocaleString()} rows/s` : 'Calculating speed...'}
+                                        {previewEtaLabel && previewRemainingRows > 0 ? ` • ETA ${previewEtaLabel}` : ''}
+                                    </p>
+                                    <div className="flex justify-center">
+                                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${etaConfidence === 'Stable'
+                                            ? 'bg-emerald-100 text-emerald-700'
+                                            : 'bg-amber-100 text-amber-700'
+                                            }`}>
+                                            ETA {etaConfidence}
+                                        </span>
+                                    </div>
+                                </div>
                             </div>
                         )}
 
                         <div className="h-full animate-in fade-in zoom-in-95 duration-700">
-                            {tableData.length > 0 ? (
+                            {activeTableData.length > 0 ? (
                                 <TanStackDataTable
-                                    data={tableData}
+                                    data={activeTableData}
                                     onDataChange={(newData) => {
-                                        setExcelCsv({ tableData: newData, isDirty: true });
+                                        setPreviewRows(newData);
+                                        setExcelCsv({ isDirty: true });
                                     }}
                                 />
                             ) : (
-                                <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-4">
-                                    <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center border border-gray-100">
-                                        <FileSpreadsheet className="w-8 h-8 opacity-20" />
+                                <div className="h-full flex items-center justify-center p-6">
+                                    <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white/85 p-5 shadow-sm">
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-11 h-11 bg-slate-50 rounded-xl flex items-center justify-center border border-slate-200">
+                                                <FileSpreadsheet className="w-5 h-5 text-slate-500" />
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-bold text-slate-900">No preview opened</p>
+                                                <p className="text-xs text-slate-600">Convert directly, or review before export.</p>
+                                            </div>
+                                        </div>
+                                        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                                            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2">
+                                                <p className="font-semibold text-emerald-800">Default action</p>
+                                                <p className="text-emerald-700">Use Convert & Export</p>
+                                            </div>
+                                            <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2">
+                                                <p className="font-semibold text-indigo-800">Before exporting</p>
+                                                <p className="text-indigo-700">Open Preview & Edit if needed</p>
+                                            </div>
+                                        </div>
                                     </div>
-                                    <p className="text-sm font-bold tracking-tight">Input data to generate preview</p>
                                 </div>
                             )}
                         </div>

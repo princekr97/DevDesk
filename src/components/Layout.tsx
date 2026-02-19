@@ -13,6 +13,7 @@ import { CommandPalette, useCommandPalette } from './CommandPalette';
 import { ROUTE_METADATA } from '../config/routes';
 import { useAppStore } from '../store/AppContext';
 import { Logo } from './Logo';
+import { useDraftPreference } from '../hooks/useDraftPreference';
 
 type IdleCallbackWindow = Window & typeof globalThis & {
     requestIdleCallback?: (callback: IdleRequestCallback, options?: IdleRequestOptions) => number;
@@ -77,6 +78,7 @@ const Layout: React.FC = () => {
     const location = useLocation();
     const { open, setOpen } = useCommandPalette();
     const { state, setTaskStatus } = useAppStore();
+    const { enabled: draftsEnabled, setEnabled: setDraftsEnabled } = useDraftPreference();
     const isWideWorkspace = location.pathname === '/app/json-viewer' || location.pathname === '/app/diff-checker';
     const preloadedRoutesRef = React.useRef<Set<string>>(new Set());
 
@@ -92,21 +94,28 @@ const Layout: React.FC = () => {
     }, []);
 
     React.useEffect(() => {
-        const preloadLikelyNextRoutes = () => {
-            preloadRoute('/app/json-viewer');
-            preloadRoute('/app/json-excel');
-            preloadRoute('/app/diff-checker');
+        const preloadLikelyNextRoute = () => {
+            const likelyByRoute: Record<string, string> = {
+                '/app/json-viewer': '/app/diff-checker',
+                '/app/diff-checker': '/app/json-viewer',
+                '/app/json-excel': '/app/json-csv',
+                '/app/json-csv': '/app/excel-csv',
+                '/app/excel-csv': '/app/json-csv',
+                '/app/word-pdf': '/app/json-viewer',
+            };
+            const nextRoute = likelyByRoute[location.pathname];
+            if (nextRoute) preloadRoute(nextRoute);
         };
 
         const idleWindow = window as IdleCallbackWindow;
         if (idleWindow.requestIdleCallback) {
-            const id = idleWindow.requestIdleCallback(preloadLikelyNextRoutes, { timeout: 1500 });
+            const id = idleWindow.requestIdleCallback(preloadLikelyNextRoute, { timeout: 2000 });
             return () => idleWindow.cancelIdleCallback?.(id);
         }
 
-        const timer = globalThis.setTimeout(preloadLikelyNextRoutes, 800);
+        const timer = globalThis.setTimeout(preloadLikelyNextRoute, 1200);
         return () => globalThis.clearTimeout(timer);
-    }, [preloadRoute]);
+    }, [preloadRoute, location.pathname]);
 
     React.useEffect(() => {
         if (state.taskStatus.state === 'running' || state.taskStatus.state === 'idle') return;
@@ -227,6 +236,15 @@ const Layout: React.FC = () => {
                             {state.taskStatus.state.toUpperCase()} {state.taskStatus.label ? `• ${state.taskStatus.label}` : ''}
                         </div>
                     )}
+                    <label className="hidden md:flex items-center gap-2 text-[11px] font-semibold text-slate-600 bg-white/80 border border-slate-200 rounded-md px-2.5 py-1">
+                        <input
+                            type="checkbox"
+                            checked={draftsEnabled}
+                            onChange={(e) => setDraftsEnabled(e.target.checked)}
+                            className="w-3.5 h-3.5 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500"
+                        />
+                        <span>Remember drafts on this device (60 min session)</span>
+                    </label>
 
                     {/* <div className="flex items-center gap-4">
                         <div className="hidden sm:flex items-center gap-2 text-xs text-gray-600 bg-gray-100 px-3 py-1.5 rounded-md">

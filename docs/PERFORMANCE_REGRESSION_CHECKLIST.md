@@ -25,6 +25,13 @@ Use this checklist before release and after major UI/data-flow changes.
 - Confirm preview loads without blocking the main thread.
 - Validate export/download completes and output opens correctly.
 - Confirm cancel/reset works mid-processing.
+- Measure converter preview and export latency:
+  - First preview chunk should appear quickly (`< 500ms` small files, `< 1.5s` medium files).
+  - No single long task in preview path should exceed ~100ms on reference machine.
+  - Export path should emit start/end perf marks and remain cancelable.
+- Validate chunked preview behavior:
+  - First chunk ~100 rows, then additional chunks ~200 rows.
+  - Preview render is capped at 1,000 rows while total row count remains accurate.
 
 ## 4) Stability and Logging
 - Confirm no runtime console errors in production build flow.
@@ -39,4 +46,3 @@ Use this checklist before release and after major UI/data-flow changes.
   - `/app/json-excel`
   - `/app/json-csv`
 - Validate layout responsiveness at mobile and desktop breakpoints.
-

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import React, { Suspense, lazy, useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import {
     GitCompare,
     Loader2,
@@ -6,12 +6,23 @@ import {
     Settings,
     XCircle
 } from 'lucide-react';
-import Editor, { DiffEditor } from '@monaco-editor/react';
 import { WorkerManager } from '../../utils/WorkerManager';
 import type { DiffRequest, DiffResult } from '../../workers/diff.worker';
 import { useAppStore } from '../../store/AppContext';
+import { useDraftPreference } from '../../hooks/useDraftPreference';
+import { DRAFT_TTL_MS, loadDraftWithStatus, saveDraft, clearDraft } from '../../utils/draftStorage';
 
 type DiffMode = 'text' | 'json';
+type DiffCheckerDraft = {
+    text1: string;
+    text2: string;
+    mode: DiffMode;
+    ignoreWhitespace: boolean;
+    sortKeys: boolean;
+};
+const DIFF_CHECKER_DRAFT_KEY = 'diff-checker';
+const MonacoEditor = lazy(() => import('@monaco-editor/react').then((mod) => ({ default: mod.default })));
+const MonacoDiffEditor = lazy(() => import('@monaco-editor/react').then((mod) => ({ default: mod.DiffEditor })));
 
 /**
  * Diff Checker Component
@@ -39,12 +50,16 @@ const DiffChecker: React.FC = () => {
     const [diffResult, setDiffResult] = useState<DiffResult | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const leftLines = useMemo(() => text1.split('\n').length, [text1]);
-    const rightLines = useMemo(() => text2.split('\n').length, [text2]);
+    const [localText1, setLocalText1] = useState(text1);
+    const [localText2, setLocalText2] = useState(text2);
+    const [draftNotice, setDraftNotice] = useState<string | null>(null);
+    const leftLines = useMemo(() => localText1.split('\n').length, [localText1]);
+    const rightLines = useMemo(() => localText2.split('\n').length, [localText2]);
+    const { enabled: draftsEnabled } = useDraftPreference();
 
     // Helpers
-    const setText1 = (val: string) => setDiffChecker({ text1: val });
-    const setText2 = (val: string) => setDiffChecker({ text2: val });
+    const setText1 = (val: string) => setLocalText1(val);
+    const setText2 = (val: string) => setLocalText2(val);
     const setMode = (val: DiffMode) => setDiffChecker({ mode: val });
     const setIgnoreWhitespace = (val: boolean) => setDiffChecker({ ignoreWhitespace: val });
 
@@ -87,8 +102,74 @@ const DiffChecker: React.FC = () => {
         };
     }, []);
 
+    useEffect(() => {
+        if (!draftsEnabled) return;
+        const { data: draft, expired } = loadDraftWithStatus<DiffCheckerDraft>(DIFF_CHECKER_DRAFT_KEY);
+        if (expired) {
+            setDraftNotice(`Session expired (${Math.round(DRAFT_TTL_MS / 60000)} min). Draft cleared.`);
+            const timer = window.setTimeout(() => setDraftNotice(null), 2000);
+            return () => window.clearTimeout(timer);
+        }
+        if (!draft) return;
+        setLocalText1(draft.text1 || '');
+        setLocalText2(draft.text2 || '');
+        setDiffChecker({
+            text1: draft.text1 || '',
+            text2: draft.text2 || '',
+            mode: draft.mode || 'text',
+            ignoreWhitespace: Boolean(draft.ignoreWhitespace),
+            sortKeys: Boolean(draft.sortKeys),
+        });
+        setDraftNotice('Draft restored');
+        const timer = window.setTimeout(() => setDraftNotice(null), 1600);
+        return () => window.clearTimeout(timer);
+    }, [draftsEnabled, setDiffChecker]);
+
+    useEffect(() => {
+        setLocalText1(text1);
+    }, [text1]);
+
+    useEffect(() => {
+        setLocalText2(text2);
+    }, [text2]);
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            if (localText1 !== text1 || localText2 !== text2) {
+                setDiffChecker({ text1: localText1, text2: localText2 });
+            }
+        }, 160);
+        return () => window.clearTimeout(timer);
+    }, [localText1, localText2, text1, text2, setDiffChecker]);
+
+    useEffect(() => {
+        if (!draftsEnabled) return;
+        const timer = window.setTimeout(() => {
+            saveDraft<DiffCheckerDraft>(DIFF_CHECKER_DRAFT_KEY, {
+                text1: localText1,
+                text2: localText2,
+                mode,
+                ignoreWhitespace,
+                sortKeys: Boolean(state.diffChecker.sortKeys),
+            });
+        }, 800);
+        return () => window.clearTimeout(timer);
+    }, [draftsEnabled, localText1, localText2, mode, ignoreWhitespace, state.diffChecker.sortKeys]);
+
+    useEffect(() => {
+        if (draftsEnabled) return;
+        const hasUnsavedData = Boolean(localText1.trim() || localText2.trim() || diffResult);
+        if (!hasUnsavedData) return;
+        const handler = (event: BeforeUnloadEvent) => {
+            event.preventDefault();
+            event.returnValue = '';
+        };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, [draftsEnabled, localText1, localText2, diffResult]);
+
     const handleCompare = useCallback(async () => {
-        if (!text1.trim() && !text2.trim()) {
+        if (!localText1.trim() && !localText2.trim()) {
             setError('Please enter text in at least one editor');
             return;
         }
@@ -100,18 +181,20 @@ const DiffChecker: React.FC = () => {
         initWorker();
 
         try {
-            let processed1 = text1;
-            let processed2 = text2;
+            let processed1 = localText1;
+            let processed2 = localText2;
 
             if (mode === 'json' && state.diffChecker.sortKeys) {
                 try {
-                    const obj1 = JSON.parse(text1);
-                    const obj2 = JSON.parse(text2);
+                    const obj1 = JSON.parse(localText1);
+                    const obj2 = JSON.parse(localText2);
                     const { deepSortKeys } = await import('../../utils/jsonUtils');
                     processed1 = JSON.stringify(deepSortKeys(obj1), null, 2);
                     processed2 = JSON.stringify(deepSortKeys(obj2), null, 2);
 
                     // Update the state with sorted strings so they appear in DiffEditor
+                    setLocalText1(processed1);
+                    setLocalText2(processed2);
                     setDiffChecker({ text1: processed1, text2: processed2 });
                 } catch (e) {
                     throw new Error('Invalid JSON structure. Sorting failed.');
@@ -135,14 +218,19 @@ const DiffChecker: React.FC = () => {
         } finally {
             setIsLoading(false);
         }
-    }, [text1, text2, mode, ignoreWhitespace, state.diffChecker.sortKeys, initWorker, setDiffChecker, setTaskStatus]);
+    }, [localText1, localText2, mode, ignoreWhitespace, state.diffChecker.sortKeys, initWorker, setDiffChecker, setTaskStatus]);
 
     const handleClear = () => {
+        const hasData = Boolean(localText1.trim() || localText2.trim() || diffResult);
+        if (hasData && !window.confirm('Clear current diff input?')) {
+            return;
+        }
         workerRef.current?.cancelAll('Cleared by user');
         setText1('');
         setText2('');
         setDiffResult(null);
         setError(null);
+        clearDraft(DIFF_CHECKER_DRAFT_KEY);
     };
 
     const handleSwap = () => {
@@ -165,6 +253,11 @@ const DiffChecker: React.FC = () => {
                         <div>
                             <h1 className="text-base sm:text-lg font-bold text-slate-900 tracking-tight">Diff Checker</h1>
                             <p className="text-xs text-slate-500 mt-0.5">Compare plain text or JSON with a fast side-by-side view.</p>
+                            {draftNotice && (
+                                <span className="inline-block mt-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-md">
+                                    {draftNotice}
+                                </span>
+                            )}
                         </div>
                         <div className="hidden sm:flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-500">
                             <span className="bg-slate-100 px-2 py-1 rounded">Left {leftLines} lines</span>
@@ -268,14 +361,18 @@ const DiffChecker: React.FC = () => {
                                 </span>
                             </div>
                             <div className="flex-1 min-h-0 border border-slate-200 rounded-xl overflow-hidden bg-white shadow-[inset_0_1px_0_rgba(255,255,255,0.65)]">
-                                <Editor
-                                    height="100%"
-                                    language={mode === 'json' ? 'json' : 'plaintext'}
-                                    value={text1}
-                                    onChange={(val) => setText1(val || '')}
-                                    theme="light"
-                                    options={commonOptions}
-                                />
+                                <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-slate-500">Loading editor...</div>}>
+                                    <MonacoEditor
+                                        height="100%"
+                                        language={mode === 'json' ? 'json' : 'plaintext'}
+                                        path="diffchecker-left-input"
+                                        value={localText1}
+                                        onChange={(val) => setText1(val || '')}
+                                        theme="light"
+                                        keepCurrentModel={true}
+                                        options={commonOptions}
+                                    />
+                                </Suspense>
                             </div>
                         </div>
 
@@ -287,14 +384,18 @@ const DiffChecker: React.FC = () => {
                                 </span>
                             </div>
                             <div className="flex-1 min-h-0 border border-slate-200 rounded-xl overflow-hidden bg-white shadow-[inset_0_1px_0_rgba(255,255,255,0.65)]">
-                                <Editor
-                                    height="100%"
-                                    language={mode === 'json' ? 'json' : 'plaintext'}
-                                    value={text2}
-                                    onChange={(val) => setText2(val || '')}
-                                    theme="light"
-                                    options={commonOptions}
-                                />
+                                <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-slate-500">Loading editor...</div>}>
+                                    <MonacoEditor
+                                        height="100%"
+                                        language={mode === 'json' ? 'json' : 'plaintext'}
+                                        path="diffchecker-right-input"
+                                        value={localText2}
+                                        onChange={(val) => setText2(val || '')}
+                                        theme="light"
+                                        keepCurrentModel={true}
+                                        options={commonOptions}
+                                    />
+                                </Suspense>
                             </div>
                         </div>
                     </div>
@@ -313,14 +414,20 @@ const DiffChecker: React.FC = () => {
                             </button>
                         </div>
                         <div className="flex-1 min-h-0">
-                            <DiffEditor
-                                height="100%"
-                                original={text1}
-                                modified={text2}
-                                language={mode === 'json' ? 'json' : 'plaintext'}
-                                theme="light"
-                                options={diffOptions}
-                            />
+                            <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-slate-500">Loading diff view...</div>}>
+                                <MonacoDiffEditor
+                                    height="100%"
+                                    original={localText1}
+                                    modified={localText2}
+                                    originalModelPath="diffchecker-original-model"
+                                    modifiedModelPath="diffchecker-modified-model"
+                                    language={mode === 'json' ? 'json' : 'plaintext'}
+                                    theme="light"
+                                    keepCurrentOriginalModel={true}
+                                    keepCurrentModifiedModel={true}
+                                    options={diffOptions}
+                                />
+                            </Suspense>
                         </div>
                     </div>
                 )}
