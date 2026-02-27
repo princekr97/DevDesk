@@ -146,6 +146,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<CsvConversionRequest>>) =>
                 const processedData = options?.flatten
                     ? normalized.map((item: any) => flattenObject(item))
                     : sanitizeForTabular(normalized);
+
+                if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
+                    const previewedCount = Math.min(PREVIEW_LIMIT, processedData.length);
+                    processedData.splice(0, previewedCount, ...options.overwriteRows);
+                }
+
                 enforceTabularLimits(processedData, 'CSV export');
 
                 const csv = Papa.unparse(processedData, {
@@ -168,10 +174,8 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<CsvConversionRequest>>) =>
                 enforceTabularLimits(results.data as any[], 'CSV parse');
 
                 if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
-                    const rowLimit = Math.min(options.overwriteRows.length, results.data.length);
-                    for (let i = 0; i < rowLimit; i++) {
-                        results.data[i] = options.overwriteRows[i];
-                    }
+                    const previewedCount = Math.min(PREVIEW_LIMIT, results.data.length);
+                    results.data.splice(0, previewedCount, ...options.overwriteRows);
                 }
 
                 const response: WorkerResponse<any[]> = {

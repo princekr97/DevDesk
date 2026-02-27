@@ -351,20 +351,20 @@ const JsonExcelConverter: React.FC = () => {
             const latestTableData = activeTableDataRef.current;
 
             if (mode === 'json-to-excel') {
-                if (latestTableData.length > 0 && isDirty) {
-                    data = JSON.stringify(latestTableData);
+                if (isDirectMode && file) {
+                    data = await file.arrayBuffer();
+                    transfer = [data];
+                } else if (localInputData.trim()) {
+                    data = localInputData;
+                } else if (file) {
+                    data = await file.arrayBuffer();
+                    transfer = [data];
                 } else {
-                    if (isDirectMode && file) {
-                        data = await file.arrayBuffer();
-                        transfer = [data];
-                    } else if (localInputData.trim()) {
-                        data = localInputData;
-                    } else if (file) {
-                        data = await file.arrayBuffer();
-                        transfer = [data];
-                    } else {
-                        throw new Error('Please provide JSON data or upload a file');
-                    }
+                    throw new Error('Please provide JSON data or upload a file');
+                }
+
+                if (isDirty && latestTableData.length > 0) {
+                    workerOptions.overwriteRows = latestTableData;
                 }
             } else {
                 if (!file) throw new Error('Please upload an Excel file');

@@ -327,22 +327,18 @@ const JsonCsvConverter: React.FC = () => {
             const latestTableData = activeTableDataRef.current;
 
             if (mode === 'json-to-csv') {
-                if (latestTableData.length > 0 && isDirty) {
-                    rowsForExport = latestTableData;
+                let rawJson = '';
+                if (localInputData.trim()) {
+                    rawJson = localInputData;
+                } else if (file) {
+                    rawJson = isDirectMode
+                        ? new TextDecoder().decode(await file.arrayBuffer())
+                        : await file.text();
                 } else {
-                    let rawJson = '';
-                    if (localInputData.trim()) {
-                        rawJson = localInputData;
-                    } else if (file) {
-                        rawJson = isDirectMode
-                            ? new TextDecoder().decode(await file.arrayBuffer())
-                            : await file.text();
-                    } else {
-                        throw new Error('Please provide JSON data or upload a file');
-                    }
-                    const parsed = JSON.parse(rawJson);
-                    rowsForExport = Array.isArray(parsed) ? parsed : [parsed];
+                    throw new Error('Please provide JSON data or upload a file');
                 }
+                const parsed = JSON.parse(rawJson);
+                rowsForExport = Array.isArray(parsed) ? parsed : [parsed];
             } else {
                 if (!file) throw new Error('Please upload a CSV file');
                 initWorker();
@@ -360,6 +356,13 @@ const JsonCsvConverter: React.FC = () => {
             }
 
 
+            if (mode === 'json-to-csv' && isDirty && latestTableData.length > 0) {
+                if (format === 'xlsx' || format === 'json') {
+                    const previewedCount = Math.min(1000, rowsForExport.length);
+                    rowsForExport.splice(0, previewedCount, ...latestTableData);
+                }
+            }
+
             if (format === 'xlsx') {
                 // Dynamic import of xlsx library
                 const XLSX = await import('xlsx');
@@ -370,11 +373,15 @@ const JsonCsvConverter: React.FC = () => {
             } else if (format === 'csv') {
                 // Use existing worker for CSV export
                 initWorker();
+                const workerOptions: any = { delimiter, flatten };
+                if (mode === 'json-to-csv' && isDirty && latestTableData.length > 0) {
+                    workerOptions.overwriteRows = latestTableData;
+                }
                 const data = JSON.stringify(rowsForExport);
                 const result = await workerRef.current!.postMessage('CONVERT_CSV', {
                     data,
                     type: 'json-to-csv',
-                    options: { delimiter, flatten }
+                    options: workerOptions
                 });
 
                 const blob = new Blob([result], { type: 'text/csv;charset=utf-8;' });

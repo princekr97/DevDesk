@@ -145,6 +145,12 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<ExcelConversionRequest>>) 
                 processedData = options?.flatten
                     ? processedData.map((item: any) => flattenObject(item))
                     : sanitizeForTabular(processedData);
+
+                if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
+                    const previewedCount = Math.min(PREVIEW_LIMIT, processedData.length);
+                    processedData.splice(0, previewedCount, ...options.overwriteRows);
+                }
+
                 enforceTabularLimits(processedData, 'Excel export');
 
                 const worksheet = XLSX.utils.json_to_sheet(processedData);
@@ -168,10 +174,8 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<ExcelConversionRequest>>) 
                 enforceTabularLimits(jsonData as any[], 'Excel parse');
 
                 if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
-                    const rowLimit = Math.min(options.overwriteRows.length, jsonData.length);
-                    for (let i = 0; i < rowLimit; i++) {
-                        jsonData[i] = options.overwriteRows[i];
-                    }
+                    const previewedCount = Math.min(PREVIEW_LIMIT, jsonData.length);
+                    jsonData.splice(0, previewedCount, ...options.overwriteRows);
                 }
 
                 const response: WorkerResponse<ExcelConversionResponse> = {
