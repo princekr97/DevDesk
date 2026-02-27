@@ -7,7 +7,9 @@ export interface ExcelConversionRequest {
     options?: {
         sheetName?: string;
         flatten?: boolean;
+        overwriteRows?: any[];
     };
+
 }
 
 export interface ExcelConversionResponse {
@@ -164,6 +166,13 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<ExcelConversionRequest>>) 
                 const worksheet = workbook.Sheets[firstSheetName];
                 const jsonData = XLSX.utils.sheet_to_json(worksheet);
                 enforceTabularLimits(jsonData as any[], 'Excel parse');
+
+                if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
+                    const rowLimit = Math.min(options.overwriteRows.length, jsonData.length);
+                    for (let i = 0; i < rowLimit; i++) {
+                        jsonData[i] = options.overwriteRows[i];
+                    }
+                }
 
                 const response: WorkerResponse<ExcelConversionResponse> = {
                     type: 'CONVERSION_SUCCESS',

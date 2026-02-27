@@ -21,6 +21,7 @@ import type { ExcelConversionRequest, ExcelConversionResponse } from '../../work
 import { useAppStore } from '../../store/AppContext';
 import { copyToClipboard } from '../../utils/jsonUtils';
 import { perfMark, perfMeasure } from '../../utils/perf';
+import { buildDownloadFileName, resolveExportBaseName } from '../../utils/fileName';
 import type { PreviewChunkPayload } from '../../types/worker';
 import { CONVERTER_LIMITS } from '../../constants';
 
@@ -43,6 +44,7 @@ const JsonExcelConverter: React.FC = () => {
     const [viewType, setViewType] = useState<ViewType>('table');
     const [isJsonCopied, setIsJsonCopied] = useState(false);
     const [localInputData, setLocalInputData] = useState(inputData);
+    const [exportFileName, setExportFileName] = useState('');
     const [previewRows, setPreviewRows] = useState<any[]>([]);
     const [previewTotalRows, setPreviewTotalRows] = useState<number | null>(totalRows);
 
@@ -98,6 +100,18 @@ const JsonExcelConverter: React.FC = () => {
         && (mode === 'excel-to-json' || isDirectMode || !localInputData.trim())
     );
     const safeModeLimitMb = Math.round(CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES / (1024 * 1024));
+
+    const activeTableDataRef = useRef(activeTableData);
+    useEffect(() => {
+        activeTableDataRef.current = previewRows;
+    }, [previewRows]);
+
+    const handleTableDataChange = useCallback((newData: any[]) => {
+        activeTableDataRef.current = newData;
+        setPreviewRows(newData);
+        setIsDirty(true);
+    }, [setIsDirty]);
+
     const jsonPreviewText = useMemo(() => {
         if (resultData && mode === 'excel-to-json') {
             return JSON.stringify(resultData, null, 2);
@@ -141,6 +155,10 @@ const JsonExcelConverter: React.FC = () => {
     useEffect(() => {
         setPreviewTotalRows(totalRows);
     }, [totalRows]);
+
+    useEffect(() => {
+        setExportFileName(file?.name ?? '');
+    }, [file]);
 
     const validateAndPreview = useCallback(async () => {
         setError(null);
@@ -297,6 +315,7 @@ const JsonExcelConverter: React.FC = () => {
         setFile(null);
         setInputData('');
         setLocalInputData('');
+        setExportFileName('');
         setPreviewRows([]);
         setTotalRows(null);
         setPreviewTotalRows(null);
@@ -321,18 +340,19 @@ const JsonExcelConverter: React.FC = () => {
         }, 60000); // 60 second timeout for conversion
 
         try {
-            const timestamp = Date.now();
-            const sourceBaseName = file?.name
-                ? file.name.replace(/\.[^/.]+$/, '')
-                : mode === 'json-to-excel'
-                    ? 'json_data'
-                    : 'excel_data';
+            const sourceBaseName = resolveExportBaseName({
+                preferredName: exportFileName,
+                sourceFileName: file?.name,
+                fallback: mode === 'json-to-excel' ? 'json_data' : 'excel_data',
+            });
             let data: any;
             let transfer: Transferable[] | undefined;
+            const workerOptions: any = { flatten };
+            const latestTableData = activeTableDataRef.current;
 
             if (mode === 'json-to-excel') {
-                if (activeTableData.length > 0 && isDirty) {
-                    data = JSON.stringify(activeTableData);
+                if (latestTableData.length > 0 && isDirty) {
+                    data = JSON.stringify(latestTableData);
                 } else {
                     if (isDirectMode && file) {
                         data = await file.arrayBuffer();
@@ -350,20 +370,24 @@ const JsonExcelConverter: React.FC = () => {
                 if (!file) throw new Error('Please upload an Excel file');
                 data = await file.arrayBuffer();
                 transfer = [data];
+                if (isDirty && latestTableData.length > 0) {
+                    workerOptions.overwriteRows = latestTableData;
+                }
             }
 
             const result = await workerRef.current!.postMessage('CONVERT_EXCEL', {
                 data,
                 type: mode,
-                options: { flatten }
+                options: workerOptions
             }, transfer, 0);
+
 
             if (mode === 'json-to-excel') {
                 const blob = new Blob([result.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${sourceBaseName}_converted_${timestamp}.xlsx`;
+                a.download = buildDownloadFileName(sourceBaseName, 'xlsx');
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -376,7 +400,7 @@ const JsonExcelConverter: React.FC = () => {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${sourceBaseName}_converted_${timestamp}.json`;
+                a.download = buildDownloadFileName(sourceBaseName, 'json');
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -460,6 +484,25 @@ const JsonExcelConverter: React.FC = () => {
                 </div>
 
                 <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+                    <div className="flex items-center bg-white px-4 py-2 rounded-xl border border-gray-100 shadow-sm space-x-3">
+                        <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Filename</span>
+                        <input
+                            type="text"
+                            value={exportFileName}
+                            onChange={(e) => setExportFileName(e.target.value)}
+                            className="text-xs font-bold text-gray-700 bg-transparent focus:outline-none w-40"
+                            placeholder={mode === 'json-to-excel' ? 'json_data' : 'excel_data'}
+                        />
+                        {file && (
+                            <button
+                                type="button"
+                                onClick={() => setExportFileName(file.name)}
+                                className="text-[10px] font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-700"
+                            >
+                                Original
+                            </button>
+                        )}
+                    </div>
                     <button onClick={handleClear} className="btn-secondary h-11 px-5">
                         <Trash2 className="w-4 h-4" />
                         <span className="text-sm font-bold">Reset</span>
@@ -644,11 +687,9 @@ const JsonExcelConverter: React.FC = () => {
                                 {activeTableData.length > 0 ? (
                                     <TanStackDataTable
                                         data={activeTableData}
-                                        onDataChange={(newData) => {
-                                            setPreviewRows(newData);
-                                            setIsDirty(true);
-                                        }}
+                                        onDataChange={handleTableDataChange}
                                     />
+
                                 ) : (
                                     <div className="h-full flex items-center justify-center p-6">
                                         <div className="w-full max-w-lg rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50 to-indigo-50/40 p-6 shadow-[0_16px_40px_rgba(15,23,42,0.08)]">

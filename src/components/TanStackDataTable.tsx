@@ -33,18 +33,16 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
     const [headerValue, setHeaderValue] = useState<string>('');
     const [scrollTop, setScrollTop] = useState(0);
     const [viewportHeight, setViewportHeight] = useState(640);
-    const [draftEdits, setDraftEdits] = useState<Record<string, string>>({});
-
-    const parentRef = useRef<HTMLDivElement>(null);
-    const scrollRafRef = useRef<number | null>(null);
     const pendingScrollTopRef = useRef(0);
-    const changeDebounceRef = useRef<number | null>(null);
+    const parentRef = useRef<HTMLDivElement | null>(null);
+    const scrollRafRef = useRef<number | null>(null);
+
 
     // Sync data when initialData changes
     React.useEffect(() => {
         setData(initialData);
-        setDraftEdits({});
     }, [initialData]);
+
 
     const effectiveData = useMemo(() => {
         if (!maxRows || data.length <= maxRows) return data;
@@ -61,14 +59,9 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
 
     const queueDataChange = React.useCallback((nextData: any[]) => {
         if (!onDataChange) return;
-        if (changeDebounceRef.current !== null) {
-            clearTimeout(changeDebounceRef.current);
-        }
-        changeDebounceRef.current = window.setTimeout(() => {
-            onDataChange(nextData);
-            changeDebounceRef.current = null;
-        }, 120);
+        onDataChange(nextData);
     }, [onDataChange]);
+
 
     // Handle cell commit
     const handleCellCommit = (rowIndex: number, columnId: string, value: string) => {
@@ -166,64 +159,16 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
                         )}
                     </div>
                 ),
-                cell: ({ getValue, row, column }) => {
-                    const value = getValue();
-                    const cellKey = `${row.index}:${column.id}`;
-                    const rawValue = value === null ? 'null' : (typeof value === 'object' ? JSON.stringify(value) : String(value ?? ''));
-                    const displayValue = draftEdits[cellKey] ?? rawValue;
+                cell: ({ getValue, row, column }) => (
+                    <EditableCell
+                        getValue={getValue}
+                        row={row}
+                        column={column}
+                        isEditable={isEditable}
+                        handleCellCommit={handleCellCommit}
+                    />
+                ),
 
-                    return (
-                        <div className="flex items-start group/cell w-full">
-                            {isEditable ? (
-                                <>
-                                    <input
-                                        type="text"
-                                        value={displayValue}
-                                        onChange={(e) => {
-                                            const nextValue = e.target.value;
-                                            setDraftEdits((prev) => ({ ...prev, [cellKey]: nextValue }));
-                                        }}
-                                        onBlur={() => {
-                                            const draftValue = draftEdits[cellKey];
-                                            if (draftValue !== undefined && draftValue !== rawValue) {
-                                                handleCellCommit(row.index, column.id, draftValue);
-                                            }
-                                            setDraftEdits((prev) => {
-                                                const next = { ...prev };
-                                                delete next[cellKey];
-                                                return next;
-                                            });
-                                        }}
-                                        onKeyDown={(e) => {
-                                            if (e.key === 'Enter') {
-                                                const draftValue = draftEdits[cellKey] ?? rawValue;
-                                                if (draftValue !== rawValue) {
-                                                    handleCellCommit(row.index, column.id, draftValue);
-                                                }
-                                                setDraftEdits((prev) => {
-                                                    const next = { ...prev };
-                                                    delete next[cellKey];
-                                                    return next;
-                                                });
-                                                (e.currentTarget as HTMLInputElement).blur();
-                                            } else if (e.key === 'Escape') {
-                                                setDraftEdits((prev) => {
-                                                    const next = { ...prev };
-                                                    delete next[cellKey];
-                                                    return next;
-                                                });
-                                            }
-                                        }}
-                                        className="w-full bg-transparent border border-transparent focus:border-indigo-300 focus:bg-white focus:shadow-sm rounded-lg px-2 py-1.5 -mx-2 transition-all min-h-[34px]"
-                                    />
-                                    <Edit3 className="w-3 h-3 text-indigo-400 opacity-0 group-hover/cell:opacity-100 absolute right-2 top-3 pointer-events-none" />
-                                </>
-                            ) : (
-                                <span className="whitespace-pre-wrap break-words w-full block text-sm leading-relaxed" title={displayValue}>{displayValue}</span>
-                            )}
-                        </div>
-                    );
-                },
                 enableSorting: true,
                 enableResizing: true,
             });
@@ -248,7 +193,8 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
         }
 
         return cols;
-    }, [headers, editingHeader, headerValue, isEditable, draftEdits, queueDataChange, data]);
+    }, [headers, editingHeader, headerValue, isEditable, queueDataChange, data]);
+
 
     // Create table instance
     const table = useReactTable({
@@ -303,10 +249,8 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
             if (scrollRafRef.current !== null) {
                 cancelAnimationFrame(scrollRafRef.current);
             }
-            if (changeDebounceRef.current !== null) {
-                clearTimeout(changeDebounceRef.current);
-            }
         };
+
     }, []);
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
@@ -433,6 +377,67 @@ const TanStackDataTable: React.FC<TanStackDataTableProps> = ({
                         </span>
                     </div>
                 </div>
+            )}
+        </div>
+    );
+};
+
+// Isolated EditableCell component prevents focus loss during table re-renders
+const EditableCell = ({
+    getValue,
+    row,
+    column,
+    isEditable,
+    handleCellCommit,
+}: {
+    getValue: () => any;
+    row: any;
+    column: any;
+    isEditable: boolean;
+    handleCellCommit: (rowIndex: number, columnId: string, value: string) => void;
+}) => {
+    const rawValue = getValue();
+    const strValue = rawValue === null ? 'null' : (typeof rawValue === 'object' ? JSON.stringify(rawValue) : String(rawValue ?? ''));
+    const [value, setValue] = useState(strValue);
+
+    useEffect(() => {
+        setValue(strValue);
+    }, [strValue]);
+
+    const onBlur = () => {
+        if (value !== strValue) {
+            handleCellCommit(row.index, column.id, value);
+        }
+    };
+
+    const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+        if (e.key === 'Enter') {
+            if (value !== strValue) {
+                handleCellCommit(row.index, column.id, value);
+            }
+            e.currentTarget.blur();
+        } else if (e.key === 'Escape') {
+            setValue(strValue);
+            e.currentTarget.blur();
+        }
+    };
+
+    return (
+        <div className="flex items-start group/cell w-full">
+            {isEditable ? (
+                <>
+                    <input
+                        type="text"
+                        value={value}
+                        onChange={(e) => setValue(e.target.value)}
+                        onBlur={onBlur}
+                        onKeyDown={onKeyDown}
+                        className="w-full bg-transparent border border-transparent focus:border-indigo-300 focus:bg-white focus:shadow-sm rounded-lg px-2 py-1.5 -mx-2 transition-all min-h-[34px]"
+                    />
+                    <Edit3 className="w-3 h-3 text-indigo-400 opacity-0 group-hover/cell:opacity-100 absolute right-2 top-3 pointer-events-none" />
+                </>
+            ) : (
+                <span className="whitespace-pre-wrap break-words w-full block text-sm leading-relaxed" title={strValue}>{strValue}</span>
             )}
         </div>
     );

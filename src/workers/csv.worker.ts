@@ -7,7 +7,9 @@ export interface CsvConversionRequest {
     options?: {
         delimiter?: string;
         flatten?: boolean;
+        overwriteRows?: any[];
     };
+
 }
 
 const FIRST_PREVIEW_CHUNK = 100;
@@ -165,11 +167,19 @@ self.onmessage = async (e: MessageEvent<WorkerMessage<CsvConversionRequest>>) =>
                 });
                 enforceTabularLimits(results.data as any[], 'CSV parse');
 
+                if (options?.overwriteRows && Array.isArray(options.overwriteRows)) {
+                    const rowLimit = Math.min(options.overwriteRows.length, results.data.length);
+                    for (let i = 0; i < rowLimit; i++) {
+                        results.data[i] = options.overwriteRows[i];
+                    }
+                }
+
                 const response: WorkerResponse<any[]> = {
                     type: 'CONVERSION_SUCCESS',
                     payload: results.data,
                     id,
                 };
+
                 self.postMessage(response);
             }
             return;

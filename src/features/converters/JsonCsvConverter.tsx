@@ -21,6 +21,7 @@ import type { CsvConversionRequest } from '../../workers/csv.worker';
 import { useAppStore } from '../../store/AppContext';
 import { copyToClipboard } from '../../utils/jsonUtils';
 import { perfMark, perfMeasure } from '../../utils/perf';
+import { buildDownloadFileName, resolveExportBaseName } from '../../utils/fileName';
 import type { PreviewChunkPayload } from '../../types/worker';
 import { CONVERTER_LIMITS } from '../../constants';
 
@@ -34,16 +35,19 @@ const JsonCsvConverter: React.FC = () => {
         inputData,
         mode,
         totalRows,
+        isDirty,
         flatten,
         delimiter,
         isDirectMode
     } = state.jsonCsv;
+
 
     const [resultData, setResultData] = useState<any>(null);
     const [viewType, setViewType] = useState<ViewType>('table');
     const [showExportMenu, setShowExportMenu] = useState(false);
     const [isJsonCopied, setIsJsonCopied] = useState(false);
     const [localInputData, setLocalInputData] = useState(inputData);
+    const [exportFileName, setExportFileName] = useState('');
     const [previewRows, setPreviewRows] = useState<any[]>([]);
     const [previewTotalRows, setPreviewTotalRows] = useState<number | null>(totalRows);
 
@@ -84,6 +88,18 @@ const JsonCsvConverter: React.FC = () => {
         && (mode === 'csv-to-json' || isDirectMode || !localInputData.trim())
     );
     const safeModeLimitMb = Math.round(CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES / (1024 * 1024));
+
+    const activeTableDataRef = useRef(activeTableData);
+    useEffect(() => {
+        activeTableDataRef.current = previewRows;
+    }, [previewRows]);
+
+    const handleTableDataChange = useCallback((newData: any[]) => {
+        activeTableDataRef.current = newData;
+        setPreviewRows(newData);
+        setIsDirty(true);
+    }, [setIsDirty]);
+
     const jsonPreviewText = useMemo(() => {
         if (resultData && mode === 'csv-to-json') {
             return JSON.stringify(resultData, null, 2);
@@ -141,6 +157,10 @@ const JsonCsvConverter: React.FC = () => {
     useEffect(() => {
         setPreviewTotalRows(totalRows);
     }, [totalRows]);
+
+    useEffect(() => {
+        setExportFileName(file?.name ?? '');
+    }, [file]);
 
     const validateAndPreview = useCallback(async () => {
         setError(null);
@@ -275,6 +295,7 @@ const JsonCsvConverter: React.FC = () => {
         setFile(null);
         setInputData('');
         setLocalInputData('');
+        setExportFileName('');
         setPreviewRows([]);
         setTotalRows(null);
         setPreviewTotalRows(null);
@@ -296,40 +317,48 @@ const JsonCsvConverter: React.FC = () => {
         workerRef.current?.cancelAll('Superseded by a newer export request');
 
         try {
-            const timestamp = Date.now();
-            const sourceBaseName = file?.name
-                ? file.name.replace(/\.[^/.]+$/, '')
-                : mode === 'json-to-csv'
-                    ? 'json_data'
-                    : 'csv_data';
+            const sourceBaseName = resolveExportBaseName({
+                preferredName: exportFileName,
+                sourceFileName: file?.name,
+                fallback: mode === 'json-to-csv' ? 'json_data' : 'csv_data',
+            });
             let rowsForExport: any[] = [];
 
-            if (activeTableData.length > 0) {
-                rowsForExport = activeTableData;
-            } else if (mode === 'json-to-csv') {
-                let rawJson = '';
-                if (localInputData.trim()) {
-                    rawJson = localInputData;
-                } else if (file) {
-                    rawJson = isDirectMode
-                        ? new TextDecoder().decode(await file.arrayBuffer())
-                        : await file.text();
+            const latestTableData = activeTableDataRef.current;
+
+            if (mode === 'json-to-csv') {
+                if (latestTableData.length > 0 && isDirty) {
+                    rowsForExport = latestTableData;
                 } else {
-                    throw new Error('Please provide JSON data or upload a file');
+                    let rawJson = '';
+                    if (localInputData.trim()) {
+                        rawJson = localInputData;
+                    } else if (file) {
+                        rawJson = isDirectMode
+                            ? new TextDecoder().decode(await file.arrayBuffer())
+                            : await file.text();
+                    } else {
+                        throw new Error('Please provide JSON data or upload a file');
+                    }
+                    const parsed = JSON.parse(rawJson);
+                    rowsForExport = Array.isArray(parsed) ? parsed : [parsed];
                 }
-                const parsed = JSON.parse(rawJson);
-                rowsForExport = Array.isArray(parsed) ? parsed : [parsed];
             } else {
                 if (!file) throw new Error('Please upload a CSV file');
                 initWorker();
                 const data = await file.arrayBuffer();
+                const workerOptions: any = { delimiter, flatten };
+                if (isDirty && latestTableData.length > 0) {
+                    workerOptions.overwriteRows = latestTableData;
+                }
                 const parsed = await workerRef.current!.postMessage('CONVERT_CSV', {
                     data,
                     type: 'csv-to-json',
-                    options: { delimiter, flatten }
+                    options: workerOptions
                 }, [data]);
                 rowsForExport = Array.isArray(parsed) ? parsed : [parsed];
             }
+
 
             if (format === 'xlsx') {
                 // Dynamic import of xlsx library
@@ -337,7 +366,7 @@ const JsonCsvConverter: React.FC = () => {
                 const ws = XLSX.utils.json_to_sheet(rowsForExport);
                 const wb = XLSX.utils.book_new();
                 XLSX.utils.book_append_sheet(wb, ws, 'Data');
-                XLSX.writeFile(wb, `${sourceBaseName}_converted_${timestamp}.xlsx`);
+                XLSX.writeFile(wb, buildDownloadFileName(sourceBaseName, 'xlsx'));
             } else if (format === 'csv') {
                 // Use existing worker for CSV export
                 initWorker();
@@ -352,7 +381,7 @@ const JsonCsvConverter: React.FC = () => {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${sourceBaseName}_converted_${timestamp}.csv`;
+                a.download = buildDownloadFileName(sourceBaseName, 'csv');
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -363,7 +392,7 @@ const JsonCsvConverter: React.FC = () => {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${sourceBaseName}_converted_${timestamp}.json`;
+                a.download = buildDownloadFileName(sourceBaseName, 'json');
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -453,6 +482,25 @@ const JsonCsvConverter: React.FC = () => {
                 </div>
 
                 <div className="flex items-center space-x-3">
+                    <div className="flex items-center bg-white px-4 py-2 rounded-xl border border-gray-100 shadow-sm space-x-3">
+                        <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Filename</span>
+                        <input
+                            type="text"
+                            value={exportFileName}
+                            onChange={(e) => setExportFileName(e.target.value)}
+                            className="text-xs font-bold text-gray-700 bg-transparent focus:outline-none w-40"
+                            placeholder={mode === 'json-to-csv' ? 'json_data' : 'csv_data'}
+                        />
+                        {file && (
+                            <button
+                                type="button"
+                                onClick={() => setExportFileName(file.name)}
+                                className="text-[10px] font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-700"
+                            >
+                                Original
+                            </button>
+                        )}
+                    </div>
                     <button onClick={handleClear} className="btn-secondary h-11 px-5">
                         <Trash2 className="w-4 h-4" />
                         <span className="text-sm font-bold">Reset</span>
@@ -466,8 +514,8 @@ const JsonCsvConverter: React.FC = () => {
 
                     {/* Export Dropdown */}
                     <div className="relative">
-                    <button
-                        onClick={() => setShowExportMenu(!showExportMenu)}
+                        <button
+                            onClick={() => setShowExportMenu(!showExportMenu)}
                             disabled={isLoading}
                             className="btn-primary-gradient h-11 px-8 shadow-indigo-100"
                         >
@@ -672,14 +720,12 @@ const JsonCsvConverter: React.FC = () => {
                                 {activeTableData.length > 0 ? (
                                     <TanStackDataTable
                                         data={activeTableData}
-                                        onDataChange={(newData) => {
-                                            setPreviewRows(newData);
-                                            setIsDirty(true);
-                                        }}
+                                        onDataChange={handleTableDataChange}
                                         onHeaderChange={() => {
                                             // Column rename handled in DataPreviewTable
                                         }}
                                     />
+
                                 ) : (
                                     <div className="h-full flex items-center justify-center p-6">
                                         <div className="w-full max-w-lg rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50 to-indigo-50/40 p-6 shadow-[0_16px_40px_rgba(15,23,42,0.08)]">

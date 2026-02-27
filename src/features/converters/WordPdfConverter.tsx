@@ -12,6 +12,7 @@ import { WorkerManager } from '../../utils/WorkerManager';
 import FileUploader from '../../components/FileUploader';
 import type { WordPdfRequest, WordPdfResponse } from '../../workers/wordPdf.worker';
 import { useAppStore } from '../../store/AppContext';
+import { buildDownloadFileName, resolveExportBaseName } from '../../utils/fileName';
 
 type ConversionMode = 'word-to-pdf' | 'pdf-to-word';
 
@@ -79,12 +80,16 @@ const WordPdfConverter: React.FC = () => {
 
             const blobType = mode === 'word-to-pdf' ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
             const extension = mode === 'word-to-pdf' ? 'pdf' : 'docx';
+            const sourceBaseName = resolveExportBaseName({
+                sourceFileName: file.name,
+                fallback: 'converted_document',
+            });
 
             const blob = new Blob([result.data], { type: blobType });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `converted_${Date.now()}.${extension}`;
+            a.download = buildDownloadFileName(sourceBaseName, extension);
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);

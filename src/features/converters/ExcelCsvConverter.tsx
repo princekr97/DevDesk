@@ -13,6 +13,7 @@ import { WorkerManager } from '../../utils/WorkerManager';
 import FileUploader from '../../components/FileUploader';
 import TanStackDataTable from '../../components/TanStackDataTable';
 import { perfMark, perfMeasure } from '../../utils/perf';
+import { buildDownloadFileName, resolveExportBaseName } from '../../utils/fileName';
 import { CONVERTER_LIMITS } from '../../constants';
 
 const ExcelCsvConverter: React.FC = () => {
@@ -45,7 +46,19 @@ const ExcelCsvConverter: React.FC = () => {
     const previewSafeModeActive = Boolean(file && file.size > CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES);
     const safeModeLimitMb = Math.round(CONVERTER_LIMITS.SAFE_MODE_PREVIEW_FILE_BYTES / (1024 * 1024));
 
+    const activeTableDataRef = useRef(activeTableData);
+    useEffect(() => {
+        activeTableDataRef.current = previewRows;
+    }, [previewRows]);
+
+    const handleTableDataChange = useCallback((newData: any[]) => {
+        activeTableDataRef.current = newData;
+        setPreviewRows(newData);
+        setExcelCsv({ isDirty: true });
+    }, [setExcelCsv]);
+
     const excelWorkerRef = useRef<WorkerManager<any, any> | null>(null);
+
     const csvWorkerRef = useRef<WorkerManager<any, any> | null>(null);
 
     const initWorkers = useCallback(() => {
@@ -202,10 +215,15 @@ const ExcelCsvConverter: React.FC = () => {
 
         try {
             const sourceExtension = file.name.split('.').pop()?.toLowerCase();
-            const baseName = fileName.split('.')[0] || file.name.split('.')[0];
-            const timestamp = Date.now();
+            const baseName = resolveExportBaseName({
+                preferredName: fileName,
+                sourceFileName: file.name,
+                fallback: 'converted_data',
+            });
 
-            if (activeTableData.length === 0) {
+            const latestTableData = activeTableDataRef.current;
+
+            if (!isDirty || latestTableData.length === 0) {
                 const sourceBuffer = await file.arrayBuffer();
 
                 if (saveMode === 'csv') {
@@ -214,7 +232,7 @@ const ExcelCsvConverter: React.FC = () => {
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = `${baseName}_converted_${timestamp}.csv`;
+                        a.download = buildDownloadFileName(baseName, 'csv');
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
@@ -234,7 +252,7 @@ const ExcelCsvConverter: React.FC = () => {
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = `${baseName}_converted_${timestamp}.csv`;
+                        a.download = buildDownloadFileName(baseName, 'csv');
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
@@ -246,7 +264,7 @@ const ExcelCsvConverter: React.FC = () => {
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = `${baseName}_converted_${timestamp}.xlsx`;
+                        a.download = buildDownloadFileName(baseName, 'xlsx');
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
@@ -277,44 +295,67 @@ const ExcelCsvConverter: React.FC = () => {
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = `${baseName}_converted_${timestamp}.xlsx`;
+                        a.download = buildDownloadFileName(baseName, 'xlsx');
                         document.body.appendChild(a);
                         a.click();
                         document.body.removeChild(a);
                         URL.revokeObjectURL(url);
                     }
                 }
-            } else if (saveMode === 'csv') {
-                const result = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
-                    data: JSON.stringify(activeTableData),
-                    type: 'json-to-csv'
-                }, undefined, 0);
-
-                const blob = new Blob([result], { type: 'text/csv;charset=utf-8;' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${baseName}_converted_${timestamp}.csv`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
             } else {
-                const result = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
-                    data: JSON.stringify(activeTableData),
-                    type: 'json-to-excel'
-                }, undefined, 0);
+                // Modified rows scenario - read from source file and overwrite with preview rows
+                const sourceBuffer = await file.arrayBuffer();
+                let fullData: any[] = [];
 
-                const blob = new Blob([result.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${baseName}_converted_${timestamp}.xlsx`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                if (sourceExtension === 'csv') {
+                    const parsed = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
+                        data: sourceBuffer,
+                        type: 'csv-to-json',
+                        options: { overwriteRows: latestTableData }
+                    }, [sourceBuffer], 0);
+                    fullData = Array.isArray(parsed) ? parsed : [parsed];
+                } else {
+                    const parsed = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                        data: sourceBuffer,
+                        type: 'excel-to-json',
+                        options: { overwriteRows: latestTableData }
+                    }, [sourceBuffer], 0);
+                    fullData = Array.isArray(parsed.data) ? parsed.data : [parsed.data];
+                }
+
+                if (saveMode === 'csv') {
+                    const result = await csvWorkerRef.current!.postMessage('CONVERT_CSV', {
+                        data: JSON.stringify(fullData),
+                        type: 'json-to-csv'
+                    }, undefined, 0);
+
+                    const blob = new Blob([result], { type: 'text/csv;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = buildDownloadFileName(baseName, 'csv');
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                } else {
+                    const result = await excelWorkerRef.current!.postMessage('CONVERT_EXCEL', {
+                        data: JSON.stringify(fullData),
+                        type: 'json-to-excel'
+                    }, undefined, 0);
+
+                    const blob = new Blob([result.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = buildDownloadFileName(baseName, 'xlsx');
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }
             }
+
 
             perfMark('excel-csv-export-complete');
             perfMeasure('excel-csv-export-total', 'excel-csv-export-start', 'excel-csv-export-complete');
@@ -385,6 +426,13 @@ const ExcelCsvConverter: React.FC = () => {
                                 className="text-xs font-bold text-gray-700 bg-transparent focus:outline-none w-40"
                                 placeholder="Export name..."
                             />
+                            <button
+                                type="button"
+                                onClick={() => setExcelCsv({ fileName: file.name })}
+                                className="text-[10px] font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-700"
+                            >
+                                Original
+                            </button>
                         </div>
                     )}
                 </div>
@@ -499,11 +547,9 @@ const ExcelCsvConverter: React.FC = () => {
                             {activeTableData.length > 0 ? (
                                 <TanStackDataTable
                                     data={activeTableData}
-                                    onDataChange={(newData) => {
-                                        setPreviewRows(newData);
-                                        setExcelCsv({ isDirty: true });
-                                    }}
+                                    onDataChange={handleTableDataChange}
                                 />
+
                             ) : (
                                 <div className="h-full flex items-center justify-center p-6">
                                     <div className="w-full max-w-lg rounded-3xl border border-slate-200/80 bg-gradient-to-br from-white via-slate-50 to-indigo-50/40 p-6 shadow-[0_16px_40px_rgba(15,23,42,0.08)]">
